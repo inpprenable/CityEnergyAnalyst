@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse
 
 import psutil
@@ -133,8 +133,8 @@ def cleanup_job_temp_files(job_id: str):
 async def get_jobs(
     session: SessionDep,
     project_id: CEAProjectID,
-    limit: int | None = Query(None, description="Maximum number of jobs to return (most recent first)"),
-    state: int | None = Query(None, description="Filter by job state (0=PENDING, 1=STARTED, 2=SUCCESS, 3=ERROR, 4=CANCELED, 5=KILLED)"),
+    limit: Optional[int] = Query(None, description="Maximum number of jobs to return (most recent first)"),
+    state: Optional[int] = Query(None, description="Filter by job state (0=PENDING, 1=STARTED, 2=SUCCESS, 3=ERROR, 4=CANCELED, 5=KILLED)"),
     exclude_deleted: bool = Query(True, description="Exclude deleted jobs from results")
 ) -> List[JobInfo]:
     """

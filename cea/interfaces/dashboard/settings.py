@@ -13,15 +13,6 @@ from cea.interfaces.dashboard.lib.logs import getCEAServerLogger
 logger = getCEAServerLogger("cea-server-settings")
 
 
-class StackAuthSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix=ENV_VAR_PREFIX + "auth_",
-                                      env_file=('.env', '.env.local'), extra="ignore")
-
-    project_id: Optional[str] = None
-    publishable_client_key: Optional[str] = None
-    stack_uri: Optional[str] = "https://api.stack-auth.com"
-
-
 class LimitSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix=ENV_VAR_PREFIX + "limit_",
                                       env_file=('.env', '.env.local'), extra="ignore")

@@ -11,8 +11,6 @@ from sqlmodel import select
 from typing_extensions import Annotated
 
 import cea.config
-from cea.interfaces.dashboard.lib.auth import CEAAuthError
-from cea.interfaces.dashboard.lib.auth.providers import StackAuth, AuthClient
 from cea.interfaces.dashboard.lib.cache.base import AsyncDictCache
 from cea.interfaces.dashboard.lib.cache.provider import get_cache, get_dict_cache
 from cea.interfaces.dashboard.lib.cache.settings import CONFIG_CACHE_TTL
@@ -240,60 +238,38 @@ def get_project_root(user_id: CEAUserID) -> Optional[str]:
     return project_root
 
 
-def get_user_id(auth_client: CEAAuthClient) -> str:
-    # Return local user if local mode
+USER_ID_HEADER = "X-Auth-Request-User"
+USER_EMAIL_HEADER = "X-Auth-Request-Email"
+USER_NAME_HEADER = "X-Auth-Request-Preferred-Username"
+
+
+def get_user_id(request: Request) -> str:
     if settings.local:
         logger.info(f"Using `{LOCAL_USER_ID}`")
         return LOCAL_USER_ID
 
-    # Try to get user id from request cookie
-    if auth_client is not None:
-        try:
-            return auth_client.get_user_id()
-        except CEAAuthError as e:
-            logger.error(e)
-            # raise Exception("Unable to verify user token")
+    user_id = request.headers.get(USER_ID_HEADER)
+    if user_id:
+        return user_id
 
     logger.info(f"Unable to determine current user, using `{LOCAL_USER_ID}`")
     return LOCAL_USER_ID
 
 
-def get_user(auth_client: CEAAuthClient) -> Dict[str, str]:
+def get_user(request: Request) -> Dict[str, str]:
     if settings.local:
         return {'id': LOCAL_USER_ID}
 
-    # Try to get user id from request cookie
-    if auth_client is not None:
-        try:
-            user = auth_client.get_current_user()
-            if user.get("client_read_only_metadata") is None:
-                user["onboarded"] = False
-                user["pro_user"] = False
-            else:
-                user["onboarded"] = user['client_read_only_metadata'].get("onboarded", False)
-                user["pro_user"] = user['client_read_only_metadata'].get("pro_user", False)
-            return user
-        except CEAAuthError as e:
-            logger.error(e)
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=str(e),
-            )
+    user_id = request.headers.get(USER_ID_HEADER)
+    if user_id:
+        return {
+            'id': user_id,
+            'primary_email': request.headers.get(USER_EMAIL_HEADER),
+            'display_name': request.headers.get(USER_NAME_HEADER),
+        }
 
     logger.info(f"Unable to determine current user, using `{LOCAL_USER_ID}`")
     return {'id': LOCAL_USER_ID}
-
-
-def get_auth_client(request: Request) -> Optional[AuthClient]:
-    if settings.local:
-        return None
-
-    auth_client = StackAuth.from_request_cookies(request.cookies)
-    if auth_client.access_token is not None:
-        return auth_client
-
-    logger.debug("Unable to determine auth client")
-    return None
 
 
 def check_auth_for_demo(request: Request, user_id: CEAUserID):
@@ -334,7 +310,6 @@ CEAStreams = Annotated[AsyncDictCache, Depends(get_streams)]
 CEAServerUrl = Annotated[str, Depends(get_server_url)]
 CEAProjectRoot = Annotated[Optional[str], Depends(get_project_root)]
 CEAServerSettings = Annotated[Settings, Depends(get_settings)]
-CEAAuthClient = Annotated[AuthClient, Depends(get_auth_client)]
 CEAServerLimits = Annotated[LimitSettings, Depends(get_limits)]
 
 CEASeverDemoAuthCheck = Depends(check_auth_for_demo)
