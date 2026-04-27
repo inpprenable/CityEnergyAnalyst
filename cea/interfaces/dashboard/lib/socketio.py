@@ -7,7 +7,7 @@ from socketio.exceptions import ConnectionRefusedError
 
 from cea.interfaces.dashboard.dependencies import settings
 from cea.interfaces.dashboard.lib.cache.settings import cache_settings
-from cea.interfaces.dashboard.lib.database.models import LOCAL_USER_ID
+from cea.interfaces.dashboard.lib.database.models import LOCAL_USER_ID, ensure_user_cached
 from cea.interfaces.dashboard.lib.logs import getCEAServerLogger
 from cea.interfaces.dashboard.settings import get_settings
 
@@ -105,6 +105,7 @@ async def connect(sid, environ, auth):
         logger.error('authentication failed: no forwarded user header')
         raise ConnectionRefusedError('authentication failed. no forwarded user header')
 
+    await ensure_user_cached(user_id)
     await sio.enter_room(sid, f"user-{user_id}")
 
     return True

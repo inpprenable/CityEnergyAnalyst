@@ -5,6 +5,7 @@ from enum import IntEnum
 from typing import Optional
 
 from pydantic import AwareDatetime, computed_field
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, SQLModel, JSON, DateTime, BigInteger, select, inspect, text
 
 import cea.scripts
@@ -173,6 +174,51 @@ async def initialize_db():
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
+
+USER_SEEN_CACHE_TTL = 1800  # 30 minutes
+
+
+async def ensure_user(user_id: str) -> None:
+    """
+    Insert a User row for the given id if it does not exist yet.
+
+    Idempotent and race-safe: concurrent callers that both find the row
+    missing will race on INSERT; the loser catches IntegrityError.
+    """
+    if user_id == LOCAL_USER_ID:
+        return  # handled by ensure_local_user()
+
+    try:
+        async with get_session_context() as session:
+            result = await session.execute(select(User).where(User.id == user_id))
+            if result.scalar() is not None:
+                return
+            session.add(User(id=user_id))
+            logger.info(f"Provisioning user on first authentication: {user_id}")
+    except IntegrityError:
+        # Lost an INSERT race with a concurrent request — the row now exists.
+        pass
+
+
+async def ensure_user_cached(user_id: str) -> None:
+    """
+    Ensure a User row exists for `user_id`, using the shared cache to skip
+    the DB round-trip once the id has been seen.
+    """
+    if user_id == LOCAL_USER_ID:
+        return
+    if database_settings.url is None:
+        return
+
+    from cea.interfaces.dashboard.lib.cache.provider import get_cache
+    cache = get_cache()
+    cache_key = f"user_seen_{user_id}"
+    if await cache.get(cache_key) is not None:
+        return
+
+    await ensure_user(user_id)
+    await cache.set(cache_key, True, ttl=USER_SEEN_CACHE_TTL)
+
 
 async def ensure_local_user():
     """

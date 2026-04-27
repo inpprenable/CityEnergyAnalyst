@@ -14,7 +14,7 @@ import cea.config
 from cea.interfaces.dashboard.lib.cache.base import AsyncDictCache
 from cea.interfaces.dashboard.lib.cache.provider import get_cache, get_dict_cache
 from cea.interfaces.dashboard.lib.cache.settings import CONFIG_CACHE_TTL
-from cea.interfaces.dashboard.lib.database.models import LOCAL_USER_ID, Project, Config
+from cea.interfaces.dashboard.lib.database.models import LOCAL_USER_ID, Project, Config, ensure_user_cached
 from cea.interfaces.dashboard.lib.database.session import SessionDep, get_session_context
 from cea.interfaces.dashboard.lib.database.settings import database_settings
 from cea.interfaces.dashboard.lib.logs import logger, getCEAServerLogger
@@ -243,25 +243,27 @@ USER_EMAIL_HEADER = "X-Auth-Request-Email"
 USER_NAME_HEADER = "X-Auth-Request-Preferred-Username"
 
 
-def get_user_id(request: Request) -> str:
+async def get_user_id(request: Request) -> str:
     if settings.local:
         logger.info(f"Using `{LOCAL_USER_ID}`")
         return LOCAL_USER_ID
 
     user_id = request.headers.get(USER_ID_HEADER)
     if user_id:
+        await ensure_user_cached(user_id)
         return user_id
 
     logger.info(f"Unable to determine current user, using `{LOCAL_USER_ID}`")
     return LOCAL_USER_ID
 
 
-def get_user(request: Request) -> Dict[str, str]:
+async def get_user(request: Request) -> Dict[str, str]:
     if settings.local:
         return {'id': LOCAL_USER_ID}
 
     user_id = request.headers.get(USER_ID_HEADER)
     if user_id:
+        await ensure_user_cached(user_id)
         return {
             'id': user_id,
             'primary_email': request.headers.get(USER_EMAIL_HEADER),
