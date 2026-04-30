@@ -100,7 +100,7 @@ async def connect(sid, environ, auth):
 
     # Auth is handled upstream by oauth2-proxy; the user id is forwarded
     # via the X-Auth-Request-User header by the traefik ForwardAuth middleware.
-    user_id = environ.get('HTTP_X_AUTH_REQUEST_USER')
+    user_id = environ.get('HTTP_X_FORWARDED_USER')
     if not user_id:
         logger.error('authentication failed: no forwarded user header')
         raise ConnectionRefusedError('authentication failed. no forwarded user header')

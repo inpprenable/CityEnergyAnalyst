@@ -238,9 +238,9 @@ def get_project_root(user_id: CEAUserID) -> Optional[str]:
     return project_root
 
 
-USER_ID_HEADER = "X-Auth-Request-User"
-USER_EMAIL_HEADER = "X-Auth-Request-Email"
-USER_NAME_HEADER = "X-Auth-Request-Preferred-Username"
+USER_ID_HEADER = "X-Forwarded-User"
+USER_EMAIL_HEADER = "X-Forwarded-Email"
+USER_NAME_HEADER = "X-Forwarded-Preferred-Username"
 
 
 async def get_user_id(request: Request) -> str:
