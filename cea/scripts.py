@@ -4,6 +4,7 @@ Provides the list of scripts known to the CEA - to be used by interfaces built o
 
 
 import os
+from functools import lru_cache
 from typing import List, TYPE_CHECKING
 
 import yaml
@@ -114,7 +115,14 @@ class CeaScript(object):
         for locator_spec in self.input_files:
             method_name, args = locator_spec[0], locator_spec[1:]
             method = getattr(locator, method_name)
-            path = method(*self._lookup_args(config, locator, args))
+
+            lookup_args = self._lookup_args(config, locator, args)
+
+            # TODO: Implement a more robust way to handle list arguments, e.g. expanded into multiple calls to the method.
+            if any(isinstance(arg, list) for arg in lookup_args):
+                continue
+
+            path = method(*lookup_args)
             if not os.path.exists(os.path.abspath(os.path.normpath(os.path.expanduser(path)))):
                 yield [method_name, path]
 
@@ -126,22 +134,36 @@ class CeaScript(object):
                 result.append(locator.get_zone_building_names()[0])
             else:
                 # expect an fqname for the config object
-                result.append(config.get(arg))
+                if ':' not in arg:
+                    raise ValueError(f"Invalid argument '{arg}' in input file specification for script '{self.name}'. "
+                                     f"Expected a fully qualified parameter name like 'section:parameter'.")
+
+                value = config.get(arg)
+                result.append(value)
         return result
 
 
+@lru_cache(maxsize=1)
+def _load_scripts_yml() -> List[CeaScript]:
+    """Load and parse scripts.yml once for the lifetime of the process."""
+    with open(SCRIPTS_YML, "r", encoding="utf-8") as fp:
+        scripts_by_category = yaml.load(fp, Loader=yaml.CLoader)
+    return [
+        CeaScript(script_dict, category)
+        for category, scripts in scripts_by_category.items()
+        for script_dict in scripts
+    ]
+
+
 def list_scripts(plugins):
-    """List all scripts in scripts.yml and those defined in configured plugins
+    """List all scripts in scripts.yml and those defined in configured plugins.
     :parameter List[CeaPlugin] plugins: the list of plugins to include in the search for scripts.
     """
-    with open(SCRIPTS_YML, "r") as fp:
-        scripts_by_category = yaml.load(fp, Loader=yaml.CLoader)
+    yield from _load_scripts_yml()
     for plugin in plugins:
-        scripts_by_category.update(plugin.scripts)
-
-    for category in scripts_by_category.keys():
-        for script_dict in scripts_by_category[category]:
-            yield CeaScript(script_dict, category)
+        for category, scripts in plugin.scripts.items():
+            for script_dict in scripts:
+                yield CeaScript(script_dict, category)
 
 
 def by_name(script_name, plugins=None):

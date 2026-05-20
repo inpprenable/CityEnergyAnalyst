@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 import cea.config
 import cea.inputlocator
+from cea.interfaces.dashboard.lib.logs import getCEAServerLogger
 import cea.schemas
 from cea.databases import CEADatabase, CEADatabaseException
 from cea.datamanagement.format_helper.cea4_verify_db import cea4_verify_db
@@ -33,6 +34,8 @@ from cea.utilities.schedule_reader import schedule_to_file, read_cea_schedule, s
 from cea.utilities.standardize_coordinates import get_geographic_coordinate_system
 
 router = APIRouter()
+
+logger = getCEAServerLogger("cea-server-inputs")
 
 COLORS = {
     'surroundings': get_color_array('grey_light'),
@@ -236,11 +239,28 @@ async def save_all_inputs(project_info: CEAProjectInfo, form: InputForm):
     return await run_in_threadpool(fn)
 
 
+def _build_choices_cache(locator):
+    """Pre-read all choice lookup files once, keyed by (locator_method, column)."""
+    cache = {}
+    for db_info in INPUTS.values():
+        for column in db_info['columns'].values():
+            if 'choice' not in column:
+                continue
+            lookup_path_method = column['choice']['lookup']['path']
+            path = getattr(locator, lookup_path_method)()
+            key = (lookup_path_method, column['choice']['lookup']['column'])
+            if key not in cache:
+                cache[key] = (path, get_choices(column['choice'], path))
+    return cache
+
+
 def get_building_properties(scenario: str):
     locator = cea.inputlocator.InputLocator(scenario)
     store = {'tables': {}, 'columns': {}}
-    for db in INPUTS:
-        db_info = INPUTS[db]
+
+    choices_cache = _build_choices_cache(locator)
+
+    for db, db_info in INPUTS.items():
         locator_method = db_info['location']
         file_path = getattr(locator, locator_method)()
         file_type = db_info['file_type']
@@ -253,22 +273,19 @@ def get_building_properties(scenario: str):
                     raise FileNotFoundError(f"File not found: {file_path}")
 
                 table_df = geopandas.read_file(file_path)
-                table_df = pd.DataFrame(
-                    table_df.drop(columns='geometry'))
+                table_df = pd.DataFrame(table_df.drop(columns='geometry'))
                 if 'geometry' in db_columns:
                     del db_columns['geometry']
                 if 'reference' in db_columns and 'reference' not in table_df.columns:
                     table_df['reference'] = None
-                store['tables'][db] = json.loads(
-                    table_df.set_index('name').to_json(orient='index'))
+                store['tables'][db] = json.loads(table_df.set_index('name').to_json(orient='index'))
             else:
                 table_df = pd.read_csv(file_path)
                 if 'reference' in db_columns and 'reference' not in table_df.columns:
                     table_df['reference'] = None
                 store['tables'][db] = table_df.set_index("name").to_dict(orient='index')
         except (IOError, DriverError, ValueError, FileNotFoundError) as e:
-            print(f"Error reading {db} from {file_path}: {e}")
-            # Continue to try getting column definitions
+            logger.warning(f"Error reading {db} from {file_path}: {e}")
             store['tables'][db] = None
 
         # Get column definitions from schema
@@ -277,10 +294,11 @@ def get_building_properties(scenario: str):
             for column_name, column in db_columns.items():
                 columns[column_name]['type'] = column['type']
                 if 'choice' in column:
-                    path = getattr(locator, column['choice']['lookup']['path'])()
+                    lookup_path_method = column['choice']['lookup']['path']
+                    lookup_col = column['choice']['lookup']['column']
+                    path, choices = choices_cache[(lookup_path_method, lookup_col)]
                     columns[column_name]['path'] = path
-                    # TODO: Try to optimize this step to decrease the number of file reading
-                    columns[column_name]['choices'] = get_choices(column['choice'], path)
+                    columns[column_name]['choices'] = choices
                 if 'constraints' in column:
                     columns[column_name]['constraints'] = column['constraints']
                 if 'regex' in column:
@@ -294,8 +312,7 @@ def get_building_properties(scenario: str):
                 columns[column_name]['unit'] = column["unit"]
             store['columns'][db] = dict(columns)
         except Exception as e:
-            print(f"Error reading column property from schemas: {e}")
-            # Set data to None as well if column definitions cannot be read
+            logger.warning(f"Error reading column property from schemas: {e}")
             store['tables'][db] = None
             store['columns'][db] = None
 
@@ -339,7 +356,7 @@ def get_network(scenario: str, network_type):
         network_json['properties'] = {'connected_buildings': connected_buildings}
         return network_json, connected_buildings, crs
     except IOError as e:
-        print(e)
+        logger.warning(f"Error reading network layout: {e}")
         return None, [], None
     except Exception:
         traceback.print_exc()

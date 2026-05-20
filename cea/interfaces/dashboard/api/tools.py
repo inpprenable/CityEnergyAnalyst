@@ -1,22 +1,66 @@
+import os
 from collections import defaultdict
 from itertools import groupby
 from typing import Dict, Any, List, Optional
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
 import cea.config
 import cea.scripts
 from cea.schemas import schemas
-from .utils import deconstruct_parameters
-from cea.interfaces.dashboard.dependencies import CEAConfig, CEADatabaseConfig, CEASeverDemoAuthCheck
+from .utils import deconstruct_parameters, validate_scenario_name
+from cea.interfaces.dashboard.utils import secure_path
+from cea.interfaces.dashboard.dependencies import CEAConfig, CEADatabaseConfig, CEASeverDemoAuthCheck, CEAProjectRoot
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def validate_parameter(parameter, value, parameter_name: str = None) -> tuple[bool, str | None]:
+def _normalize_choice_value(param: cea.config.ChoiceParameterBase, value: Any, choices: list[str]) -> Any:
+    valid_choices = set(choices)
+    is_multi_choice = isinstance(param, cea.config.MultiChoiceParameter)
+
+    def _raise_missing_choices_error(reason: str) -> None:
+        message = f"No choices available for non-nullable parameter {param.fqname} while {reason}."
+        logger.error(message)
+        raise ValueError(message)
+
+    if is_multi_choice:
+        if value is None:
+            return []
+
+        if isinstance(value, list):
+            raw_values = value
+        elif isinstance(value, str):
+            raw_values = [v.strip() for v in value.split(',') if v.strip()]
+        else:
+            raw_values = [value]
+
+        return [str(v).strip() for v in raw_values if str(v).strip() in valid_choices]
+
+    if value is None:
+        if param.nullable:
+            return None
+        if not choices:
+            _raise_missing_choices_error("normalising a missing value")
+        return choices[0]
+
+    normalized_value = str(value).strip()
+    if param.nullable and normalized_value == '':
+        return None
+
+    if normalized_value in valid_choices:
+        return normalized_value
+
+    if not choices and not param.nullable:
+        _raise_missing_choices_error(f"normalising value {normalized_value}")
+
+    return choices[0] if choices else None
+
+
+def validate_parameter(parameter, value, parameter_name: str | None = None) -> tuple[bool, str | None]:
     """
     Validate a parameter value using its encode() method.
 
@@ -34,6 +78,39 @@ def validate_parameter(parameter, value, parameter_name: str = None) -> tuple[bo
         error_message = f"Validation error: {str(e)}"
         logger.error(f"Unexpected validation error for {parameter_name or parameter.name}: {error_message}")
         return False, error_message
+
+
+def validate_and_apply_parameters(
+    candidates: list[tuple[cea.config.Parameter, Any]],
+    set_empty: list | None = None,
+) -> None:
+    """
+    Validate a list of (parameter, value) pairs and apply them atomically.
+
+    Raises ValueError with a dict of field errors if any value fails validation.
+    Only calls parameter.set() / parameter.set_empty() after all values pass.
+
+    Args:
+        candidates: List of (parameter, value) pairs to validate then set.
+        set_empty: Optional list of parameters to call set_empty() on (no validation needed).
+    """
+    field_errors = {}
+    to_set = []
+
+    for parameter, value in candidates:
+        is_valid, error_message = validate_parameter(parameter, value)
+        if not is_valid:
+            field_errors[parameter.name] = error_message
+        else:
+            to_set.append((parameter, value))
+
+    if field_errors:
+        raise ValueError(field_errors)
+
+    for parameter in (set_empty or []):
+        parameter.set_empty()
+    for parameter, value in to_set:
+        parameter.set(value)
 
 
 class ToolDescription(BaseModel):
@@ -61,8 +138,19 @@ async def get_tool_list(config: CEAConfig) -> Dict[str, List[ToolDescription]]:
 
 
 @router.get('/{tool_name}')
-async def get_tool_properties(config: CEAConfig, tool_name: str) -> ToolProperties:
+async def get_tool_properties(config: CEAConfig, project_root: CEAProjectRoot, tool_name: str,
+                               project: Optional[str] = None,
+                               scenario_name: Optional[str] = None) -> ToolProperties:
     # TODO: Add plugin support
+
+    # Set project and scenario on config to ensure parameters that depend on them are constructed correctly
+    if project is not None:
+        if project_root is not None and not project.startswith(project_root):
+            project = os.path.join(project_root, project)
+        config.project = secure_path(project)
+    if scenario_name is not None:
+        config.scenario_name = validate_scenario_name(scenario_name)
+
     script = cea.scripts.by_name(tool_name, plugins=config.plugins)
 
     parameters = []
@@ -95,19 +183,25 @@ async def restore_default_config(config: CEAConfig, tool_name: str):
     # Ensure that parameters that depend on scenario files will be parsed correctly
     default_config.scenario = config.scenario
 
-    # Set the parameters to their default values
+    candidates = []
+    set_empty = []
+
     for parameter in parameters_for_script(tool_name, config):
         if parameter.name == 'scenario':
             continue
-        
-        default_value = default_config.sections[parameter.section.name].parameters[parameter.name].get()
-        # Don't set parameters that are not nullable and have an empty default value
-        if default_value == "" and not parameter.nullable:
-            logger.debug(f"Skipping {parameter.name} since it has no default value")
-            continue
 
-        parameter.set(default_value)
-    
+        default_value = default_config.sections[parameter.section.name].parameters[parameter.name].get()
+        # Set empty string for non-nullable parameters with empty default values, bypassing validation
+        if not default_value and default_value is not False and default_value != 0 and not parameter.nullable:
+            set_empty.append(parameter)
+        else:
+            candidates.append((parameter, default_value))
+
+    try:
+        validate_and_apply_parameters(candidates, set_empty)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={'message': 'Validation failed', 'field_errors': e.args[0]})
+
     if isinstance(config, CEADatabaseConfig):
         await config.save()
     else:
@@ -136,7 +230,7 @@ async def save_tool_config(config: CEAConfig, tool_name: str, payload: Dict[str,
     if field_errors:
         logger.error(f'[save_tool_config] Validation failed with {len(field_errors)} errors')
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail={
                 'message': 'Validation failed',
                 'field_errors': field_errors
@@ -171,7 +265,7 @@ async def validate_field(config: CEAConfig, tool_name: str, payload: Dict[str, A
     form_values = payload.get('form_values', {})
 
     if not parameter_name:
-        raise HTTPException(status_code=400, detail="parameter_name is required")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="parameter_name is required")
 
     # Temporarily set form values on config to provide context for validation
     for param in parameters_for_script(tool_name, config):
@@ -190,7 +284,7 @@ async def validate_field(config: CEAConfig, tool_name: str, payload: Dict[str, A
             break
 
     if not target_parameter:
-        raise HTTPException(status_code=404, detail=f"Parameter '{parameter_name}' not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Parameter '{parameter_name}' not found")
 
     # Validate using encode() method
     is_valid, error_message = validate_parameter(target_parameter, value, parameter_name)
@@ -232,19 +326,15 @@ async def get_parameter_metadata(config: CEAConfig, tool_name: str, payload: Dic
         if affected_parameters and param.name not in affected_parameters:
             continue
 
-        # For ChoiceParameters, get updated choices
-        if isinstance(param, cea.config.ChoiceParameter):
+        # For choice-backed parameters, get updated choices and normalise the current value
+        if isinstance(param, cea.config.ChoiceParameterBase):
             try:
                 choices = param._choices  # type: ignore[attr-defined]
-                current_value = param.get()
-
-                # If current value not in choices, use first choice or None
-                if current_value not in choices:
-                    current_value = choices[0] if choices else None
+                current_value = _normalize_choice_value(param, param.get(), choices)
 
                 result[param.name] = {
                     'choices': choices,
-                    'value': current_value
+                    'value': current_value,
                 }
                 logger.debug(f"[get_parameter_metadata] {param.name}: {len(choices)} choices, value={current_value}")
             except Exception as e:
@@ -256,11 +346,15 @@ async def get_parameter_metadata(config: CEAConfig, tool_name: str, payload: Dic
 
 @router.post('/{tool_name}/check')
 async def check_tool_inputs(config: CEAConfig, tool_name: str, payload: Dict[str, Any]):
-    # Set config parameters
-    for parameter in parameters_for_script(tool_name, config):
-        if parameter.name in payload:
-            value = payload[parameter.name]
-            parameter.set(value)
+    candidates = [
+        (parameter, payload[parameter.name])
+        for parameter in parameters_for_script(tool_name, config)
+        if parameter.name in payload and parameter.name != 'scenario'
+    ]
+    try:
+        validate_and_apply_parameters(candidates)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={'message': 'Validation failed', 'field_errors': e.args[0]})
 
     # TODO: Add plugin support
     script = cea.scripts.by_name(tool_name, plugins=config.plugins)
@@ -281,7 +375,7 @@ async def check_tool_inputs(config: CEAConfig, tool_name: str, payload: Dict[str
             _script = cea.scripts.by_name(script_suggestion, plugins=config.plugins)
             scripts.append({"label": _script.label, "name": _script.name})
 
-        raise HTTPException(status_code=400,
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail={"message": "Missing input files",
                                     "script_suggestions": list(scripts)})
 

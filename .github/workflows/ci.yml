@@ -8,11 +8,21 @@ on:
     branches: [master, release-**]
     # Ignore changes in the interfaces directory since they do not have tests
     # TODO: Add tests for interfaces module
-    paths: ['cea/**', 'pyproject.toml', 'pixi.lock', '!cea/interfaces/**']
+    paths: 
+      - 'cea/**'
+      - 'pyproject.toml'
+      - 'pixi.lock'
+      - '!cea/interfaces/**'
+      - '!**/*.md'
 
   push:
     branches: [master]
-    paths: ['cea/**', 'pyproject.toml', 'pixi.lock', '!cea/interfaces/**']
+    paths: 
+      - 'cea/**'
+      - 'pyproject.toml'
+      - 'pixi.lock'
+      - '!cea/interfaces/**'
+      - '!**/*.md'
 
 concurrency:
   # Use head_ref for PRs, fall back to ref for pushes
@@ -48,3 +58,22 @@ jobs:
       - name: Run integration tests
         if: github.event.pull_request.draft == false
         run: pixi run integration
+
+      - name: List test scenario locations (on failure)
+        if: failure()
+        shell: bash
+        run: |
+          echo "Searching for test scenario outputs..."
+          ls -la ~ || true
+          find ~ -maxdepth 2 -type d \( -name "zug_heating" -o -name "sg_cooling" \) 2>/dev/null || echo "No test scenarios found"
+
+      - name: Upload test scenario artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-scenarios-${{ matrix.os }}
+          path: |
+              ${{ env.HOME }}/zug_heating/
+              ${{ env.HOME }}/sg_cooling/
+          retention-days: 3
+          if-no-files-found: warn

@@ -1,10 +1,11 @@
 import os
 from typing import List
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel, field_validator
 
 from cea import MissingInputDataException
+from cea.interfaces.dashboard.api.utils import validate_scenario_name
 from cea.interfaces.dashboard.dependencies import CEAProjectRoot
 from cea.interfaces.dashboard.map_layers import get_layers_grouped_by_category, load_layer
 
@@ -15,6 +16,22 @@ class LayerParams(BaseModel):
     project: str
     scenario_name: str
     parameters: dict
+
+    @field_validator('scenario_name')
+    @classmethod
+    def _validate_scenario_name(cls, v):
+        return validate_scenario_name(v)
+
+
+class DeleteChoiceParams(BaseModel):
+    project: str
+    scenario_name: str
+    value: str
+
+    @field_validator('scenario_name')
+    @classmethod
+    def _validate_scenario_name(cls, v):
+        return validate_scenario_name(v)
 
 
 class LayerDescription(BaseModel):
@@ -69,9 +86,36 @@ async def get_layer_parameter_choices(project_root: CEAProjectRoot, params: Laye
         choices = layer.get_parameter_choices(parameter, params.parameters)
     except ValueError as e:
         print(e)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     return choices
+
+
+@router.post('/{layer_category}/{layer_name}/{parameter}/choice/delete')
+async def delete_layer_parameter_choice(
+    project_root: CEAProjectRoot,
+    params: DeleteChoiceParams,
+    layer_category: str,
+    layer_name: str,
+    parameter: str,
+):
+    layer_class = load_layer(layer_name, layer_category)
+
+    project_path = params.project
+    if project_root is not None and not project_path.startswith(project_root):
+        project_path = os.path.join(project_root, project_path)
+
+    try:
+        layer = layer_class(project=project_path, scenario_name=params.scenario_name)
+        layer.delete_parameter_choice(parameter, params.value)
+    except NotImplementedError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to delete: {e}")
+
+    return {"success": True}
 
 
 @router.post('/{layer_category}/{layer_name}/{parameter}/range')
@@ -89,7 +133,7 @@ async def get_layer_parameter_range(project_root: CEAProjectRoot, params: LayerP
         range_values = layer.get_parameter_range(parameter, params.parameters)
     except ValueError as e:
         print(e)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     return range_values
 
@@ -109,10 +153,10 @@ async def generate_map_layer(project_root: CEAProjectRoot, params: LayerParams, 
         output = layer.generate_output(params.parameters)
     except MissingInputDataException as e:
         print(e)
-        raise HTTPException(status_code=400, detail="Missing input files")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing input files")
     except ValueError as e:
         print(e)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     return output
 
@@ -133,4 +177,4 @@ async def check_map_layer(project_root: CEAProjectRoot,params: LayerParams, laye
         layer.check_for_missing_input_files(params.parameters)
     except MissingInputDataException as e:
         print(e)
-        raise HTTPException(status_code=400, detail="Missing input files")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing input files")
