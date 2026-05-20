@@ -262,8 +262,8 @@ async def get_user(request: Request) -> Dict[str, str]:
         await ensure_user_cached(user_id)
         return {
             'id': user_id,
-            'primary_email': request.headers.get(USER_EMAIL_HEADER),
-            'display_name': request.headers.get(USER_NAME_HEADER),
+            'primary_email': request.headers.get(USER_EMAIL_HEADER) or "unknown@example.com",
+            'display_name': request.headers.get(USER_NAME_HEADER) or "Unknown User",
         }
 
     logger.info(f"Unable to determine current user, using `{LOCAL_USER_ID}`")
