@@ -49,6 +49,10 @@ class TestValidSingleOrigins:
     def test_subdomain_with_port(self):
         make_settings(cors_origin="https://app.example.com:3000")
 
+    def test_underscore_in_hostname(self):
+        # Ascend deployments use hosts such as cea_docker.<domain> (local patch, not upstream).
+        make_settings(cors_origin="https://cea_docker.serval-labs-ci-hook.work")
+
 
 class TestPortGroupRegression:
     """Regression: ':' was inside the hostname char-class, letting the hostname
