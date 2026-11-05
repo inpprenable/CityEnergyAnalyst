@@ -22,7 +22,8 @@
 - **Scannable structure** - Use headers, bullets, and short paragraphs
 
 **Updating existing agent documentation**:
-- **IMPORTANT**: When making code changes in a directory, ALWAYS update the corresponding `AGENTS.md` file in that directory
+- **IMPORTANT**: When a code change makes AGENTS.md content in that directory inaccurate (a documented pattern, gotcha, limitation, or API changed) — or introduces a new pattern/gotcha as non-obvious as what's already there — update AGENTS.md in the same change: fix or remove what's now wrong, add what's now missing.
+- **Never add**: status/progress notes, "completed features" checklists, changelog entries, or time/scope estimates. That's PR-description content — it goes stale immediately and isn't actionable guidance.
 - **Create comprehensive user documentation** - When detailed explanations are needed, create proper documentation in `docs/` with sections, examples, and context for human readers. AGENTS.md should remain concise LLM reference only
 
 **Code quality directives**:
@@ -38,16 +39,20 @@
 
 City Energy Analyst (CEA) - Urban building energy simulation platform for low-carbon city design.
 
+## Architecture Context to Keep in Mind
+
+- **File-based today, object storage planned**: a scenario is a folder of CSV/shapefiles on disk,
+  not a database — there is a plan to move towards object storage, but that has not happened yet.
+  Don't assume today's file layout is permanent; don't assume a future object store either.
+- **Both a local tool and a deployed multi-user web app**: the same code runs as a single-user
+  local CLI/dashboard and as a web app serving concurrent users, potentially across containers
+  with network-backed scenario storage. A solution that is fine for one user on local disk (a
+  full-file re-read, a folder hash, an uncached recomputation on every request) can become a
+  scaling or concurrency problem once deployed. When proposing a solution, say explicitly which
+  of these two contexts it was designed for, and flag the tradeoff rather than silently picking
+  whichever is simplest to implement. See `cea/interfaces/dashboard/AGENTS.md` for the concrete
+  patterns this leads to (statelessness, pull-over-push, avoiding unbounded I/O per request).
+
 ## Environment Setup
 
-**Pixi (Recommended)**:
-```bash
-pixi install && pixi run setup-dev
-pixi run cea dashboard  # Run dashboard
-```
-
-**Docker**:
-```bash
-docker build -t cea .
-docker run -p 5050:5050 cea  # Dashboard on port 5050
-```
+See `pyproject.toml` for the `setup-dev` and `cea` pixi tasks, and `Dockerfile` for the container build.

@@ -28,10 +28,31 @@ from typing import Dict, Optional, Tuple
 
 import cea.config
 import cea.inputlocator
+from cea.scripts import tool_ref
 
 
 # Constants
 HOURS_IN_YEAR = 8760
+
+# Carriers `cea/schemas.yml`'s ``get_final_energy_buildings_file``
+# entry declares as `_MWh` columns. The annual-summary loops always
+# write these (zero-filled when a scenario's database doesn't
+# include the carrier) so downstream consumers — KPIs, plots,
+# emissions calculator — can read the schema's columns without a
+# defensive missing-column branch. Extra carriers from
+# ``available_carriers(locator)`` are written alongside but the
+# schema-promised set is the floor.
+_DECLARED_CARRIER_CODES = frozenset({
+    'GRID',
+    'NATURALGAS',
+    'OIL',
+    'COAL',
+    'WOOD',
+    'DH',
+    'DC',
+    'SOLAR',
+    'PV',
+})
 
 
 def calculate_building_final_energy(
@@ -62,7 +83,7 @@ def calculate_building_final_energy(
     if not os.path.exists(demand_file):
         raise FileNotFoundError(
             f"Demand file not found for building {building_name}: {demand_file}\n"
-            f"Please run 'cea demand' first."
+            f"Please run {tool_ref('demand')} first."
         )
 
     demand_df = pd.read_csv(demand_file)
@@ -472,6 +493,20 @@ def parse_supply_assembly(
 
     # Load component information from COMPONENTS database
     component_info = load_component_info(primary_component, locator)
+    primary_type = component_info.get('type')
+
+    # PV panels generate electricity from irradiance — they are not a supply
+    # component for heating, cooling, or DHW services. Electricity supply is
+    # handled separately via the solar technology settings and
+    # calculate_solar_generation(); it never goes through this assembly path.
+    if primary_type == 'PV':
+        raise ValueError(
+            f"Assembly {assembly_code!r}: primary component {primary_component!r} "
+            f"is a photovoltaic panel (type='PV') and cannot be used in a "
+            f"heating, cooling, or DHW supply assembly. "
+            f"PV generation is configured via the solar technology settings, "
+            f"not via supply assemblies."
+        )
 
     # For district systems, carrier is DH or DC, not the plant fuel
     if scale == 'DISTRICT':
@@ -485,13 +520,31 @@ def parse_supply_assembly(
     else:
         carrier = component_info['carrier']
         efficiency = component_info['efficiency']
+        # Thermally-driven devices (e.g. absorption chillers) resolve to
+        # carrier=None because their energy source depends on an upstream
+        # heat supply — not representable in the building-scale carrier model.
+        if carrier is None and primary_type not in ('SC', 'PVT'):
+            raise ValueError(
+                f"Assembly {assembly_code!r}: primary component {primary_component!r} "
+                f"resolved to carrier=None (thermally-driven device). "
+                f"Building-scale supply assemblies require a component with a direct "
+                f"fuel or electricity carrier. Use a district-scale assembly for "
+                f"thermally-driven equipment such as absorption chillers."
+            )
+        # efficiency=None would crash demand / efficiency downstream.
+        if efficiency is None and primary_type not in ('SC', 'PVT'):
+            raise ValueError(
+                f"Assembly {assembly_code!r}: primary component {primary_component!r} "
+                f"resolved to efficiency=None. Ensure the component row contains one "
+                f"of: min_eff_rating, min_eff_rating_seasonal, rated_COP_seasonal, "
+                f"therm_eff_design, elec_eff_design, or aux_power."
+            )
 
     # When the primary is a solar-thermal component (SC or PVT), the caller
     # needs the secondary component's info too so it can back up the tank
     # when solar output is insufficient. Load it eagerly and stash it on the
     # supply config. We only block on this for building-scale hot-water
     # assemblies — district plants with SC primaries aren't supported.
-    primary_type = component_info.get('type')
     secondary_info = None
     if primary_type in ('SC', 'PVT') and secondary_component:
         secondary_info = load_component_info(secondary_component, locator)
@@ -763,7 +816,7 @@ def load_district_heating_data(
     if not os.path.exists(substation_file):
         raise FileNotFoundError(
             f"District heating substation file not found for building {building_name}: {substation_file}\n"
-            f"Please run 'cea thermal-network-layout' (part 1) and 'cea thermal-network' (part 2) first."
+            f"Please run {tool_ref('network-layout')} and {tool_ref('thermal-network')} first."
         )
 
     substation_df = pd.read_csv(substation_file)
@@ -798,7 +851,7 @@ def load_district_cooling_data(
     if not os.path.exists(substation_file):
         raise FileNotFoundError(
             f"District cooling substation file not found for building {building_name}: {substation_file}\n"
-            f"Please run 'cea thermal-network-layout' (part 1) and 'cea thermal-network' (part 2) first."
+            f"Please run {tool_ref('network-layout')} and {tool_ref('thermal-network')} first."
         )
 
     substation_df = pd.read_csv(substation_file)
@@ -836,7 +889,7 @@ def load_booster_data(
     if not os.path.exists(substation_file):
         raise FileNotFoundError(
             f"District heating substation file not found for building {building_name}: {substation_file}\n"
-            f"Please run 'cea thermal-network-layout' (part 1) and 'cea thermal-network' (part 2) first."
+            f"Please run {tool_ref('network-layout')} and {tool_ref('thermal-network')} first."
         )
 
     substation_df = pd.read_csv(substation_file)
@@ -988,7 +1041,7 @@ def calculate_plant_final_energy(
     if not os.path.exists(plant_load_file):
         raise FileNotFoundError(
             f"Plant thermal load file not found: {plant_load_file}\n"
-            f"Please run 'cea thermal-network-layout' (part 1) and 'cea thermal-network' (part 2) first."
+            f"Please run {tool_ref('network-layout')} and {tool_ref('thermal-network')} first."
         )
 
     plant_load_df = pd.read_csv(plant_load_file)
@@ -1157,9 +1210,25 @@ def aggregate_buildings_summary(
         # ``feedstock_file`` entries. Legacy solar PV/PVT electricity
         # offsets are still tracked separately via the emissions
         # offset path, not here.
+        #
+        # ``_DECLARED_CARRIER_CODES`` is unioned in so every column the
+        # schema (`get_final_energy_buildings_file` in `cea/schemas.yml`)
+        # declares is always written — zero-filled for carriers the
+        # scenario's database doesn't include. Without this, KPIs and
+        # other consumers reading the schema's columns hit silent
+        # missing-column errors when (e.g.) a district has no PV.
         from cea.technologies.energy_carriers import available_carriers
-        for carrier in sorted(available_carriers(locator) | {'DH', 'DC', 'SOLAR'}):
+        all_carriers = (
+            available_carriers(locator) | {'DH', 'DC', 'SOLAR'} | _DECLARED_CARRIER_CODES
+        )
+        for carrier in sorted(all_carriers):
             row[f'{carrier}_MWh'] = carrier_totals.get(carrier, 0.0)
+
+        # Roll up the per-carrier columns into the total declared in
+        # `cea/schemas.yml` for this file. Without this, downstream
+        # consumers (e.g. KPIs that read TOTAL_MWh) hit a missing-column
+        # error even though the schema promises the column.
+        row['TOTAL_MWh'] = sum(carrier_totals.values())
 
         row['peak_demand_kW'] = peak_demand_kW
         row['peak_datetime'] = peak_datetime
@@ -1245,10 +1314,21 @@ def aggregate_buildings_summary(
         }
 
         # Carrier columns delivered to services. See building loop above
-        # for why DH/DC/SOLAR are unioned in manually.
+        # for why DH/DC/SOLAR/_DECLARED_CARRIER_CODES are all unioned in
+        # — keeps the column set identical between building and plant
+        # rows so the resulting DataFrame's columns match the schema
+        # declaration regardless of which carriers a given run uses.
         from cea.technologies.energy_carriers import available_carriers
-        for carrier in sorted(available_carriers(locator) | {'DH', 'DC', 'SOLAR'}):
+        all_carriers = (
+            available_carriers(locator) | {'DH', 'DC', 'SOLAR'} | _DECLARED_CARRIER_CODES
+        )
+        for carrier in sorted(all_carriers):
             row[f'{carrier}_MWh'] = carrier_totals.get(carrier, 0.0)
+
+        # Same TOTAL_MWh rollup the building loop writes — keeps
+        # plant + building rows column-aligned and matches the
+        # `get_final_energy_buildings_file` schema.
+        row['TOTAL_MWh'] = sum(carrier_totals.values())
 
         row['peak_demand_kW'] = peak_demand_kW
         row['peak_datetime'] = peak_datetime

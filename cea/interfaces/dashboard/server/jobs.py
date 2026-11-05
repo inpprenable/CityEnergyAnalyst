@@ -9,25 +9,27 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Annotated, Optional
 from urllib.parse import urlparse
 
 import psutil
 import sqlalchemy.exc
-from fastapi import APIRouter, HTTPException, status, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
 from pydantic import BaseModel
-from sqlalchemy.orm import undefer_group
+from sqlalchemy.orm import defer
 from sqlmodel import select, desc
 from starlette.datastructures import UploadFile as _UploadFile
 
-from cea.interfaces.dashboard.dependencies import CEAServerUrl, CEAWorkerProcesses, CEAProjectID, CEAServerSettings, \
-    CEAUserID, CEASeverDemoAuthCheck, CEAStreams
+import cea
+from cea.interfaces.dashboard.api.utils import CEAProjectID, CEAScenarioOptional, script_takes_scenario_path
+from cea.interfaces.dashboard.dependencies import CEAConfig, CEAServerUrl, CEAWorkerProcesses, CEAServerSettings, \
+    CEAUserID, CEAStreams
+from cea.interfaces.dashboard.lib.auth import create_worker_token
 from cea.interfaces.dashboard.lib.database.models import JobInfo, JobState, get_current_time
 from cea.interfaces.dashboard.lib.database.session import SessionDep
 from cea.interfaces.dashboard.lib.logs import getCEAServerLogger
 from cea.interfaces.dashboard.lib.socketio import emit_with_retry
 
-# FIXME: Add auth checks after giving workers access token
 router = APIRouter()
 logger = getCEAServerLogger("cea-server-jobs")
 
@@ -41,7 +43,8 @@ class JobOutput(BaseModel):
     output: Any
 
 
-class JobInfoResponse(BaseModel):
+class JobSummaryResponse(BaseModel):
+    """Job shape without stdout/stderr -- used for list views where log text is never loaded."""
     id: str
     script: str
     parameters: Dict[str, Any]
@@ -50,25 +53,30 @@ class JobInfoResponse(BaseModel):
     created_time: Any
     start_time: Any = None
     end_time: Any = None
-    stdout: str | None = None
-    stderr: str | None = None
     project_id: str
     script_label: str | None = None
     scenario_name: str | None = None
     duration: float | None = None
 
     @classmethod
-    def from_job_info(
-        cls,
-        job: JobInfo,
-        stdout: str | None = None,
-        stderr: str | None = None,
-    ) -> "JobInfoResponse":
+    def from_job_info(cls, job: JobInfo) -> "JobSummaryResponse":
         payload = job.model_dump(exclude={"stdout", "stderr"})
-        return cls(**payload, stdout=stdout, stderr=stderr)
+        return cls(**payload)
 
     def to_event_payload(self) -> Dict[str, Any]:
         return self.model_dump(mode='json')
+
+
+class JobInfoResponse(JobSummaryResponse):
+    """Full job shape including stdout/stderr -- only GET /jobs/{job_id} returns this; every
+    other route/event returns JobSummaryResponse, since nothing else reads log text from them."""
+    stdout: str | None = None
+    stderr: str | None = None
+
+    @classmethod
+    def from_job_info(cls, job: JobInfo) -> "JobInfoResponse":
+        payload = job.model_dump(exclude={"stdout", "stderr"})
+        return cls(**payload, stdout=job.stdout, stderr=job.stderr)
 
 
 def get_cea_job_temp_prefix(job_id: str) -> str:
@@ -159,23 +167,78 @@ def cleanup_job_temp_files(job_id: str):
         logger.error(f"Error cleaning up temp files for job {job_id}: {e}")
 
 
-@router.get("/", dependencies=[CEASeverDemoAuthCheck])
+def _normalize_job_id(job_id: str) -> str:
+    """Validate job_id is a UUID and normalize it to the hex format JobInfo.id is stored in."""
+    try:
+        return uuid.UUID(job_id).hex
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id format. Must be a valid UUID.")
+
+
+def _authorize_job_access(job: JobInfo | None, job_id: str, user_id: str) -> JobInfo:
+    """Raise 404/403 if job is missing or not owned by user_id, else return it."""
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.created_by != user_id:
+        logger.warning(f"User {user_id} attempted to access job {job_id} owned by {job.created_by}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You are not authorised to access this job"
+        )
+    return job
+
+
+async def locked_owned_job(session: SessionDep, job_id: str, user_id: CEAUserID) -> JobInfo:
+    """
+    Dependency: resolve path param {job_id} to its JobInfo row, verifying user_id
+    owns it (404 if missing, 403 if owned by someone else).
+
+    Takes a SELECT ... FOR UPDATE row lock (TOCTOU protection) -- every route using
+    this dependency mutates job state within the same request/transaction.
+    """
+    normalized_id = _normalize_job_id(job_id)
+    try:
+        result = await session.execute(
+            select(JobInfo)
+            .options(defer(JobInfo.stdout), defer(JobInfo.stderr))  # type: ignore[arg-type]
+            .where(JobInfo.id == normalized_id)
+            .with_for_update()
+        )
+    except sqlalchemy.exc.OperationalError as e:
+        logger.error(e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error")
+    job = result.scalar_one_or_none()
+    return _authorize_job_access(job, normalized_id, user_id)
+
+
+LockedOwnedJob = Annotated[JobInfo, Depends(locked_owned_job)]
+
+
+@router.get("/")
 @router.get("/list")
 async def get_jobs(
     session: SessionDep,
     project_id: CEAProjectID,
+    user_id: CEAUserID,
     limit: int = Query(50, ge=1, le=500, description="Number of jobs to return (most recent first)"),
     offset: int = Query(0, ge=0, description="Number of jobs to skip"),
-    state: Optional[int] = Query(None, description="Filter by job state (0=PENDING, 1=STARTED, 2=SUCCESS, 3=ERROR, 4=CANCELED, 5=KILLED)"),
+    state: int | None = Query(None, description="Filter by job state (0=PENDING, 1=STARTED, 2=SUCCESS, 3=ERROR, 4=CANCELED, 5=KILLED)"),
     exclude_deleted: bool = Query(True, description="Exclude deleted jobs from results")
-) -> List[JobInfo]:
+) -> List[JobSummaryResponse]:
     """
-    Get a paginated list of jobs for the current project with optional filtering.
+    Get a paginated list of jobs for the current user and project with optional filtering.
 
     Returns jobs ordered by creation time (most recent first), paginated by `limit` and `offset`.
     Jobs are filtered by deleted_at field rather than state to preserve completion states.
+
+    stdout/stderr are excluded from list results (can be large); fetch a single job via
+    GET /jobs/{job_id} for full log output.
     """
-    query = select(JobInfo).where(JobInfo.project_id == project_id)
+    query = (
+        select(JobInfo)
+        .options(defer(JobInfo.stdout), defer(JobInfo.stderr))  # type: ignore[arg-type]
+        .where(JobInfo.project_id == project_id, JobInfo.created_by == user_id)
+    )
 
     # Filter by state if specified
     if state is not None:
@@ -187,7 +250,7 @@ async def get_jobs(
 
     # Exclude deleted jobs by default based on deleted_at field
     if exclude_deleted:
-        query = query.where(JobInfo.deleted_at.is_(None))
+        query = query.where(JobInfo.deleted_at.is_(None)) # type: ignore[arg-type]
 
     # Order by created_time descending (most recent first)
     query = query.order_by(desc(JobInfo.created_time))
@@ -196,21 +259,54 @@ async def get_jobs(
     query = query.limit(limit).offset(offset)
 
     result = await session.execute(query)
-    return list(result.scalars().all())
+    jobs_list = result.scalars().all()
+
+    return [JobSummaryResponse.from_job_info(job) for job in jobs_list]
 
 
 @router.get("/{job_id}")
-async def get_job_info(session: SessionDep, job_id: str) -> JobInfoResponse:
+async def get_job_info(session: SessionDep, job_id: str, user_id: CEAUserID) -> JobInfoResponse:
     """Return a JobInfo by id"""
-    job = await session.get(JobInfo, job_id, options=[undefer_group('logs')])
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-    return JobInfoResponse.from_job_info(job, stdout=job.stdout, stderr=job.stderr)
+    normalized_id = _normalize_job_id(job_id)
+    job = await session.get(JobInfo, normalized_id)
+    job = _authorize_job_access(job, normalized_id, user_id)
+
+    return JobInfoResponse.from_job_info(job)
 
 
-@router.post("/new", dependencies=[CEASeverDemoAuthCheck])
+def resolve_job_scenario(script: str, config, scenario: Optional[str]) -> Optional[str]:
+    """Return the scenario path to use for this job, or ``None`` 
+    if the script does not take a ``ScenarioParameter`` (in which case the
+    client's ``parameters["scenario"]`` is used).
+
+    ``scenario`` is the request's header-resolved scenario context (``CEAScenarioOptional``
+    -- ``None`` when no X-CEA-Project/X-CEA-Scenario-Name pair was sent).
+
+    Raises HTTPException 422 for an unknown script name, 400 when a scenario-taking
+    script has no scenario context to resolve.
+    """
+    try:
+        needs_scenario = script_takes_scenario_path(script, config)
+    except cea.ScriptNotFoundException as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                            detail=f"Unknown script: {script}.") from e
+
+    if not needs_scenario:
+        return None
+
+    if scenario is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Scenario context required: send X-CEA-Project and X-CEA-Scenario-Name headers.",
+        )
+
+    return scenario
+
+
+@router.post("/new")
 async def create_new_job(request: Request, session: SessionDep, project_id: CEAProjectID, user_id: CEAUserID,
-                         settings: CEAServerSettings) -> JobInfoResponse:
+                         settings: CEAServerSettings, config: CEAConfig,
+                         scenario: CEAScenarioOptional) -> JobSummaryResponse:
     """Post a new job to the list of jobs to complete"""
     content_type = request.headers.get("content-type", "")
 
@@ -245,8 +341,16 @@ async def create_new_job(request: Request, session: SessionDep, project_id: CEAP
     else:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported content type.")
 
-    if script is None:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing required field: 'script'.")
+    if script is None or not isinstance(script, str) or not script.strip():
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Missing required field: 'script'.")
+
+    parameters = parameters or {}
+    if not isinstance(parameters, dict):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Field 'parameters' must be an object.")
+
+    # Resolve (and validate) the script's scenario requirement up front, before any temp
+    # files are created for this job -- a rejected request should leave nothing to clean up.
+    resolved_scenario = resolve_job_scenario(script, config, scenario)
 
     # Create job first with empty parameters to get job ID for temp file handling
     job = JobInfo(script=script, parameters={}, project_id=project_id, created_by=user_id)
@@ -254,6 +358,12 @@ async def create_new_job(request: Request, session: SessionDep, project_id: CEAP
     try:
         # Process parameters to handle any UploadFile instances
         parameters = await process_job_parameters(parameters, job.id)
+
+        if resolved_scenario is not None:
+            if parameters.get("scenario") not in (None, resolved_scenario):
+                logger.debug("Overriding client-supplied scenario %r with %r for job %s",
+                            parameters.get("scenario"), resolved_scenario, job.id)
+            parameters["scenario"] = resolved_scenario
 
         # FIXME: Forcing remote multiprocessing to be disabled for now,
         #  find solution for restricting number of processes per user
@@ -271,18 +381,14 @@ async def create_new_job(request: Request, session: SessionDep, project_id: CEAP
     await session.commit()
     await session.refresh(job)
 
-    job_payload = JobInfoResponse.from_job_info(job)
+    job_payload = JobSummaryResponse.from_job_info(job)
     event_payload = job_payload.to_event_payload()
     await emit_with_retry("cea-job-created", event_payload, room=f"user-{job.created_by}")
     return job_payload
 
 
 @router.post("/started/{job_id}")
-async def set_job_started(session: SessionDep, job_id: str) -> JobInfoResponse:
-    job = await session.get(JobInfo, job_id)
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-
+async def set_job_started(session: SessionDep, job: LockedOwnedJob) -> JobSummaryResponse:
     try:
         job.state = JobState.STARTED
         job.start_time = get_current_time()
@@ -294,25 +400,21 @@ async def set_job_started(session: SessionDep, job_id: str) -> JobInfoResponse:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
     # Emit event outside try-except so emit failures don't cause rollback
-    job_payload = JobInfoResponse.from_job_info(job)
+    job_payload = JobSummaryResponse.from_job_info(job)
     event_payload = job_payload.to_event_payload()
     await emit_with_retry("cea-worker-started", event_payload, room=f"user-{job.created_by}")
     return job_payload
 
 
 @router.post("/success/{job_id}")
-async def set_job_success(session: SessionDep, job_id: str, streams: CEAStreams,
-                          worker_processes: CEAWorkerProcesses, output: JobOutput) -> JobInfoResponse:
-    job = await session.get(JobInfo, job_id)
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-
+async def set_job_success(session: SessionDep, job: LockedOwnedJob,
+                          streams: CEAStreams, worker_processes: CEAWorkerProcesses, output: JobOutput) -> JobSummaryResponse:
     try:
         job.state = JobState.SUCCESS
         job.error = None
         job.end_time = get_current_time()
 
-        stdout_capture = await streams.pop(job_id, [])
+        stdout_capture = await streams.pop(job.id, [])
         stdout_text = "".join(stdout_capture) if stdout_capture else None
         job.stdout = stdout_text
         await session.commit()
@@ -329,7 +431,7 @@ async def set_job_success(session: SessionDep, job_id: str, streams: CEAStreams,
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
     # Emit event outside try-except so emit failures don't cause rollback
-    job_payload = JobInfoResponse.from_job_info(job, stdout=stdout_text)
+    job_payload = JobSummaryResponse.from_job_info(job)
     event_payload = job_payload.to_event_payload()
     event_payload["output"] = output.output
     await emit_with_retry("cea-worker-success", event_payload, room=f"user-{job.created_by}")
@@ -337,21 +439,17 @@ async def set_job_success(session: SessionDep, job_id: str, streams: CEAStreams,
 
 
 @router.post("/error/{job_id}")
-async def set_job_error(session: SessionDep, job_id: str, error: JobError, streams: CEAStreams,
-                        worker_processes: CEAWorkerProcesses) -> JobInfoResponse:
+async def set_job_error(session: SessionDep, job: LockedOwnedJob,
+                        error: JobError, streams: CEAStreams, worker_processes: CEAWorkerProcesses) -> JobSummaryResponse:
     message = error.message
     stacktrace = error.stacktrace
-
-    job = await session.get(JobInfo, job_id)
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
     try:
         job.state = JobState.ERROR
         job.error = message
         job.end_time = get_current_time()
 
-        stdout_capture = await streams.pop(job_id, [])
+        stdout_capture = await streams.pop(job.id, [])
         stdout_text = "".join(stdout_capture) if stdout_capture else None
         job.stdout = stdout_text
         job.stderr = stacktrace
@@ -369,25 +467,19 @@ async def set_job_error(session: SessionDep, job_id: str, error: JobError, strea
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
     # Emit event outside try-except so emit failures don't cause rollback
-    job_payload = JobInfoResponse.from_job_info(job, stdout=stdout_text, stderr=stacktrace)
+    job_payload = JobSummaryResponse.from_job_info(job)
     event_payload = job_payload.to_event_payload()
     await emit_with_retry("cea-worker-error", event_payload, room=f"user-{job.created_by}")
 
-    logger.warning(f"Error found in job {job_id}: {message}")
+    logger.warning(f"Error found in job {job.id}: {message}")
     logger.error(f"stacktrace:\n{stacktrace}")
     return job_payload
 
 
-@router.post('/start/{job_id}', dependencies=[CEASeverDemoAuthCheck])
-async def start_job(session: SessionDep, worker_processes: CEAWorkerProcesses, server_url: CEAServerUrl, job_id: str,
-                    user_id: CEAUserID, settings: CEAServerSettings):
+@router.post('/start/{job_id}')
+async def start_job(worker_processes: CEAWorkerProcesses, server_url: CEAServerUrl,
+                    job: LockedOwnedJob):
     """Start a ``cea-worker`` subprocess for the script. (FUTURE: add support for cloud-based workers"""
-
-    # Validate job_id is a valid UUID
-    try:
-        uuid.UUID(job_id)
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id format. Must be a valid UUID.")
 
     # Validate server_url is a valid HTTP/HTTPS URL
     try:
@@ -398,23 +490,6 @@ async def start_job(session: SessionDep, worker_processes: CEAWorkerProcesses, s
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid server_url. Missing hostname.")
     except Exception:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid server_url format.")
-
-    # Lock the row to prevent concurrent modifications (TOCTOU protection)
-    result = await session.execute(
-        select(JobInfo).where(JobInfo.id == job_id).with_for_update()
-    )
-    job = result.scalar_one_or_none()
-
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-
-    # Authorization check: only job creator can start
-    if job.created_by != user_id:
-        logger.warning(f"User {user_id} attempted to start job {job_id} owned by {job.created_by}")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You are not authorized to start this job"
-        )
 
     # Validate job state: must be PENDING and not deleted
     if job.state != JobState.PENDING:
@@ -430,34 +505,22 @@ async def start_job(session: SessionDep, worker_processes: CEAWorkerProcesses, s
         )
 
     # Use validated parameters in command
-    command = [sys.executable, "-m", "cea.worker", "--suppress-warnings", job_id, str(server_url)]
+    command = [sys.executable, "-m", "cea.worker", "--suppress-warnings", job.id, str(server_url)]
     logger.debug(f"command: {command}")
-    process = subprocess.Popen(command)
 
-    await worker_processes.set(job_id, process.pid)
-    return job_id
+    # Pass the worker's auth token via env var, not argv: argv ends up in `ps` output
+    # and in the debug log line above, while env vars do not.
+    worker_token = create_worker_token(job.id, job.created_by)
+    worker_env = {**os.environ, "CEA_WORKER_TOKEN": worker_token}
+    process = subprocess.Popen(command, env=worker_env)
+
+    await worker_processes.set(job.id, process.pid)
+    return job.id
 
 
-@router.post("/cancel/{job_id}", dependencies=[CEASeverDemoAuthCheck])
-async def cancel_job(session: SessionDep, job_id: str, user_id: CEAUserID,
-                     worker_processes: CEAWorkerProcesses, streams: CEAStreams) -> JobInfoResponse:
-    # Lock the row to prevent concurrent modifications (TOCTOU protection)
-    result = await session.execute(
-        select(JobInfo).where(JobInfo.id == job_id).with_for_update()
-    )
-    job = result.scalar_one_or_none()
-
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-
-    # Authorization check: only job creator can cancel
-    if job.created_by != user_id:
-        logger.warning(f"User {user_id} attempted to cancel job {job_id} owned by {job.created_by}")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You are not authorized to cancel this job"
-        )
-
+@router.post("/cancel/{job_id}")
+async def cancel_job(session: SessionDep, job: LockedOwnedJob,
+                     worker_processes: CEAWorkerProcesses, streams: CEAStreams) -> JobSummaryResponse:
     # Validate state: can only cancel PENDING or STARTED jobs (protected by row lock)
     if job.state not in (JobState.PENDING, JobState.STARTED):
         raise HTTPException(
@@ -478,7 +541,7 @@ async def cancel_job(session: SessionDep, job_id: str, user_id: CEAUserID,
         job.end_time = get_current_time()
 
         # Save any remaining stream output before clearing
-        stdout_capture = await streams.pop(job_id, [])
+        stdout_capture = await streams.pop(job.id, [])
         stdout_text = "".join(stdout_capture) if stdout_capture else None
         job.stdout = stdout_text
 
@@ -486,7 +549,7 @@ async def cancel_job(session: SessionDep, job_id: str, user_id: CEAUserID,
         await session.refresh(job)
 
         # Terminate worker process gracefully to allow cleanup functions to run
-        await cleanup_worker_process(job_id, worker_processes, force=False)
+        await cleanup_worker_process(job.id, worker_processes, force=False)
 
         # Clean up temporary files for this job
         cleanup_job_temp_files(job.id)
@@ -496,13 +559,13 @@ async def cancel_job(session: SessionDep, job_id: str, user_id: CEAUserID,
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
     # Emit event outside try-except so emit failures don't cause rollback
-    job_payload = JobInfoResponse.from_job_info(job, stdout=stdout_text)
+    job_payload = JobSummaryResponse.from_job_info(job)
     event_payload = job_payload.to_event_payload()
     await emit_with_retry("cea-worker-canceled", event_payload, room=f"user-{job.created_by}")
     return job_payload
 
 
-async def kill_job(session, job_id: str, worker_processes, streams) -> JobInfoResponse:
+async def kill_job(session, job_id: str, worker_processes, streams) -> JobSummaryResponse:
     """
     Kill a job (server-initiated termination, e.g., during shutdown).
     This is different from cancel_job which is user-initiated.
@@ -544,14 +607,14 @@ async def kill_job(session, job_id: str, worker_processes, streams) -> JobInfoRe
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
     # Emit event outside try-except so emit failures don't cause rollback
-    job_payload = JobInfoResponse.from_job_info(job, stdout=stdout_text)
+    job_payload = JobSummaryResponse.from_job_info(job)
     event_payload = job_payload.to_event_payload()
     await emit_with_retry("cea-worker-killed", event_payload, room=f"user-{job.created_by}")
     return job_payload
 
 
-@router.delete("/{job_id}", dependencies=[CEASeverDemoAuthCheck])
-async def delete_job(session: SessionDep, job_id: str, user_id: CEAUserID) -> JobInfoResponse:
+@router.delete("/{job_id}")
+async def delete_job(session: SessionDep, job: LockedOwnedJob, user_id: CEAUserID) -> JobSummaryResponse:
     """
     Mark a job as deleted (soft delete). The job row is not removed from the database,
     and the original completion state (SUCCESS/ERROR/CANCELED/KILLED) is preserved.
@@ -559,27 +622,6 @@ async def delete_job(session: SessionDep, job_id: str, user_id: CEAUserID) -> Jo
 
     Uses row-level locking to prevent TOCTOU race conditions.
     """
-    try:
-        # Lock the row to prevent concurrent modifications (TOCTOU protection)
-        result = await session.execute(
-            select(JobInfo).where(JobInfo.id == job_id).with_for_update()
-        )
-        job = result.scalar_one_or_none()
-    except sqlalchemy.exc.OperationalError as e:
-        logger.error(e)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error")
-
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-
-    # Authorization check: only job creator can delete
-    if job.created_by != user_id:
-        logger.warning(f"User {user_id} attempted to delete job {job_id} owned by {job.created_by}")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You are not authorized to delete this job"
-        )
-
     if job.state == JobState.STARTED:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Job is still running")
 
@@ -602,7 +644,7 @@ async def delete_job(session: SessionDep, job_id: str, user_id: CEAUserID) -> Jo
         await session.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    job_payload = JobInfoResponse.from_job_info(job)
+    job_payload = JobSummaryResponse.from_job_info(job)
     event_payload = job_payload.to_event_payload()
     await emit_with_retry("cea-job-deleted", event_payload, room=f"user-{job.created_by}")
     return job_payload

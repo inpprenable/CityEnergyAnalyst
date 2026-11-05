@@ -21,6 +21,7 @@ from cea.inputlocator import InputLocator
 from cea.analysis.costs.equations import calc_capex_annualized
 from cea.technologies.components import get_component_table
 from cea.technologies.energy_carriers import electricity_carrier
+from cea.scripts import tool_ref
 
 __author__ = "Zhongming Shi"
 __copyright__ = "Copyright 2026, Architecture and Building Systems - ETH Zurich"
@@ -870,7 +871,7 @@ def calculate_costs_for_whatif(whatif_name, locator):
         expected = locator.get_analysis_configuration_file(whatif_name)
         raise FileNotFoundError(
             f"configuration file not found for what-if '{whatif_name}': {expected}\n"
-            "Please run 'final-energy' first."
+            f"Please run {tool_ref('final-energy')} first."
         )
     building_configs = config_data.get('buildings', {})
     plant_configs = config_data.get('plants', {})
@@ -880,7 +881,7 @@ def calculate_costs_for_whatif(whatif_name, locator):
     if not os.path.exists(summary_file):
         raise FileNotFoundError(
             f"final_energy_buildings.csv not found for what-if '{whatif_name}': {summary_file}\n"
-            "Please run 'final-energy' first."
+            f"Please run {tool_ref('final-energy')} first."
         )
     summary_df = pd.read_csv(summary_file)
 
@@ -988,7 +989,7 @@ def main(config: cea.config.Configuration):
     whatif_names = config.what_ifs.what_if_name
     if not whatif_names:
         raise ValueError(
-            "what-if-name is required. Please select at least one what-if scenario."
+            "what-if-name is required. Please select at least one What-if Scenario."
         )
     if isinstance(whatif_names, str):
         whatif_names = [whatif_names]
@@ -998,7 +999,7 @@ def main(config: cea.config.Configuration):
     print("=" * 80)
 
     for whatif_name in whatif_names:
-        print(f"\nProcessing what-if scenario: {whatif_name}")
+        print(f"\nProcessing What-if Scenario: {whatif_name}")
         print("-" * 60)
 
         try:

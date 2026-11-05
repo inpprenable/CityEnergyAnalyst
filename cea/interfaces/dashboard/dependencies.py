@@ -1,159 +1,68 @@
 from __future__ import annotations
 
-import asyncio
 import os
-from collections import defaultdict
 from dataclasses import dataclass
-from typing import Optional, Dict, Union
+from typing import Optional, Dict
 
 from fastapi import Depends, Request, HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from typing_extensions import Annotated
 
 import cea.config
+from cea.interfaces.dashboard.lib.auth import CEAAuthError, verify_worker_token
+from cea.interfaces.dashboard.lib.auth.providers import StackAuth, AuthClient
 from cea.interfaces.dashboard.lib.cache.base import AsyncDictCache
-from cea.interfaces.dashboard.lib.cache.provider import get_cache, get_dict_cache
-from cea.interfaces.dashboard.lib.cache.settings import CONFIG_CACHE_TTL
-from cea.interfaces.dashboard.lib.database.models import LOCAL_USER_ID, Project, Config, ensure_user_cached
-from cea.interfaces.dashboard.lib.database.session import SessionDep, get_session_context
-from cea.interfaces.dashboard.lib.database.settings import database_settings
-from cea.interfaces.dashboard.lib.logs import logger, getCEAServerLogger
+from cea.interfaces.dashboard.lib.cache.provider import get_dict_cache
+from cea.interfaces.dashboard.lib.database.models import LOCAL_USER_ID, Project
+from cea.interfaces.dashboard.lib.database.session import SessionDep
+from cea.interfaces.dashboard.lib.logs import logger
 from cea.interfaces.dashboard.settings import Settings, get_settings, LimitSettings
 from cea.plots.cache import PlotCache
 
 IGNORE_CONFIG_SECTIONS = {"server", "development", "schemas"}
 
-settings = get_settings()
-cea_db_config_logger = getCEAServerLogger("cea-db-config")
-
 
 class CEALocalConfig(cea.config.Configuration):
-    def __init__(self, config_file: str = settings.config_path):
-        if not settings.local:
-            logger.warning("Using local config in non-local mode")
+    def __init__(self, config_file: str):
+        self._config_path = config_file
+        super().__init__(os.path.expanduser(config_file))
 
-        if config_file.startswith("~"):
-            config_file = os.path.expanduser(config_file)
-        super().__init__(config_file)
-
-    def save(self, config_file: str = settings.config_path) -> None:
-        if config_file.startswith("~"):
-            config_file = os.path.expanduser(config_file)
-        logger.info(f"Saving config to {config_file}")
-        super().save(config_file)
+    def save(self, config_file: str = None) -> None:
+        path = config_file if config_file is not None else self._config_path
+        logger.info(f"Saving config to {path}")
+        super().save(os.path.expanduser(path))
 
 
-class CEADatabaseConfig(cea.config.Configuration):
-    def __init__(self, user_id: str):
-        self._user_id = user_id
+class CEAStatelessConfig(cea.config.Configuration):
+    """Per-request config for non-local (cloud) mode.
 
+    Built fresh from DEFAULT_CONFIG on each request. save() is a no-op so
+    nothing is ever persisted server-side, enabling stateless horizontal scaling.
+
+    The no-op save() also neutralises the init-time self.save() in
+    Configuration.__init__ (fired when ~/cea.config is absent, e.g. in containers).
+    """
+
+    def __init__(self):
         super().__init__(cea.config.DEFAULT_CONFIG)
 
-    def __getstate__(self) -> str:
-        # Add user_id to state when pickling
-        string = super().__getstate__()
-        return f"{self._user_id}\n{string}"
+    def save(self, config_file: str = None) -> None:
+        logger.debug("save() is a no-op in non-local (stateless) mode")
 
-    def __setstate__(self, state: str):
-        # Read user_id from state when unpickling
-        user_id, string = state.split("\n", 1)
-        self._user_id = user_id
 
-        super().__setstate__(string)
+def get_cea_config(settings: CEAServerSettings) -> cea.config.Configuration:
+    """Return a config instance for this request.
 
-    def from_dict(self, config_dict: dict):
-        """
-        Create a Configuration object from a dictionary.
-        """
-        for section_name, section_dict in config_dict.items():
-            section = self.sections[section_name]
-            for parameter_name, parameter_value in section_dict.items():
-                parameter = section.parameters[parameter_name]
-                try:
-                    parameter.set(parameter_value)
-                except Exception as e:
-                    cea_db_config_logger.warning(f"Error setting `{section_name}:{parameter_name}`: {e}")
-        return self
-
-    def to_dict(self) -> dict:
-        """
-        Returns the configuration as a dictionary.
-        """
-        out = defaultdict(dict)
-
-        for section in self.sections.values():
-            for parameter in section.parameters.values():
-                try:
-                    out[section.name][parameter.name] = parameter.get()
-                except Exception as e:
-                    cea_db_config_logger.warning(f"Error reading `{section.name}:{parameter.name}`: {e}")
-                    # default_value = self.default_config.get(section.name, parameter.name)
-                    # print(f"Using default value: '{default_value}'")
-                    # out[section.name][parameter.name] = default_value
-
-        return out
-
-    @staticmethod
-    def _cache_key(user_id: str) -> str:
-        return f"cea_config_{user_id}"
-
-    @classmethod
-    async def from_user_id(cls, user_id: str) -> "CEADatabaseConfig":
-        """Return config for user, from cache if available, otherwise load from database."""
-        cached = await get_cache().get(cls._cache_key(user_id))
-        if cached is not None:
-            cea_db_config_logger.debug(f"Using cached config for user: {user_id}")
-            return cached
-
-        config = cls(user_id)
-        cea_db_config_logger.debug(f"Cache miss for user: {user_id}")
-        # Fetch config from database and update cache (if config exists for user)
-        async with get_session_context() as session:
-            try:
-                result = await session.execute(select(Config).where(Config.user_id == user_id))
-                _config = result.scalar()
-                if _config:
-                    cea_db_config_logger.debug(f"Reading config from database for user: {user_id}")
-                    config.from_dict(_config.config)
-            except Exception as e:
-                cea_db_config_logger.warning(f"Error reading config from database: {e}")
-                cea_db_config_logger.warning("Returning default config")
-
-        await get_cache().set(cls._cache_key(user_id), config, ttl=CONFIG_CACHE_TTL)
-        return config
-
-    async def save(self, config_file: str = None) -> None:
-        """Saves config to database in dict format"""
-        cea_db_config_logger.debug(f"Saving config for user: {self._user_id}")
-
-        await get_cache().set(self._cache_key(self._user_id), self, ttl=CONFIG_CACHE_TTL)
-        cea_db_config_logger.debug(f"Updated config cache for user: {self._user_id}")
-
-        # Save new config to database
-        async def _save_to_db():
-            config_dict = self.to_dict()
-            async with get_session_context() as session:
-                result = await session.execute(select(Config).where(Config.user_id == self._user_id))
-                _config = result.scalar()
-                if _config:
-                    _config.config = config_dict
-                else:
-                    session.add(Config(user_id=self._user_id, config=config_dict))
-
-        asyncio.create_task(_save_to_db())
-
-async def get_cea_config(user_id: CEAUserID) -> cea.config.Configuration:
-    """Get configuration remote database or local file"""
-
-    # Don't read config from database if user is local
-    if database_settings.url is not None and user_id != LOCAL_USER_ID:
-        return await CEADatabaseConfig.from_user_id(user_id)
-
-    # Read config from file if config_path is set
-    if settings.config_path is not None:
-        return CEALocalConfig()
-
-    raise ValueError("No config provided")
+    Local mode: disk-backed CEALocalConfig (reads/writes ~/cea.config, keeps
+    CLI parity). Non-local mode: fresh CEAStatelessConfig built from
+    DEFAULT_CONFIG with a no-op save() for stateless horizontal scaling.
+    """
+    if settings.local:
+        if settings.config_path is None:
+            raise ValueError("No config provided")
+        return CEALocalConfig(settings.config_path)
+    return CEAStatelessConfig()
 
 
 @dataclass
@@ -179,20 +88,27 @@ async def create_project(project_uri: str, owner_id: CEAUserID, session: Session
     return project
 
 
-async def get_project_id(session: SessionDep, owner_id: CEAUserID,
-                         project_root: CEAProjectRoot, project_info: CEAProjectInfo):
-    """Get the project ID from the project URI."""
-    project_uri = project_info.project
-    if project_root is not None:
-        project_uri = os.path.join(project_root, project_uri)
+async def get_or_create_project_id(project_uri: str, owner_id: CEAUserID, session: SessionDep) -> str:
+    """Look up the Project row for a resolved project URI, creating it if this is the first
+    time it's seen.
 
+    Callers must resolve ``project_uri`` themselves (e.g. via the request-scoped
+    ``X-CEA-Project`` header through ``CEAProjectID`` in ``api/utils.py``) — this helper does
+    no path resolution of its own.
+    """
     result = await session.execute(select(Project).where(Project.uri == project_uri))
     project = result.scalar()
 
     # If project not found, create a new one
     if not project:
-        logger.info(f"Creating project in database: {project_uri}")
-        project = await create_project(project_uri, owner_id, session)
+        try:
+            logger.info(f"Creating project in database: {project_uri}")
+            project = await create_project(project_uri, owner_id, session)
+        except IntegrityError:
+            # Lost a race with a concurrent request creating the same project (uri is unique)
+            await session.rollback()
+            result = await session.execute(select(Project).where(Project.uri == project_uri))
+            project = result.scalar_one()
 
     return project.id
 
@@ -213,19 +129,24 @@ async def get_streams() -> AsyncDictCache:
     return await get_dict_cache("streams", default_ttl=STREAM_CACHE_TTL)
 
 
-def get_server_url():
+def get_server_url(settings: CEAServerSettings) -> str:
     host = settings.host
     port = settings.port
     worker_url = f"http://{host}:{port}/server"
     return worker_url
 
 
-def get_project_root(user_id: CEAUserID) -> Optional[str]:
+def get_project_root(user_id: CEAUserID, settings: CEAServerSettings) -> Optional[str]:
     """Get the project root for the current user"""
     project_root = settings.project_root
 
     # Use user ID as project root for non-local mode
     if not settings.local:
+        if user_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication required.",
+            )
         if project_root is None:
             raise ValueError("Project root not set. Unable to determine project root.")
         project_root = os.path.join(os.path.normpath(project_root), user_id)
@@ -234,54 +155,147 @@ def get_project_root(user_id: CEAUserID) -> Optional[str]:
     return project_root
 
 
-USER_ID_HEADER = "X-Forwarded-User"
-USER_EMAIL_HEADER = "X-Forwarded-Email"
-USER_NAME_HEADER = "X-Forwarded-Preferred-Username"
+# (method, route name) pairs cea-worker subprocesses call back on -- route
+# *names* (get_job_info, set_job_started, ...), not paths: FastAPI/Starlette's
+# Route.path is the segment relative to the router it was declared on for some
+# versions and the fully-combined path for others (observed to differ between
+# a pinned dev environment and an unpinned production build of the same
+# commit), so matching on path strings is version-fragile. route.name defaults
+# to the endpoint function's __name__ and isn't affected by prefix-combining.
+# See cea/worker.py: get_job, started, success, error, stream write. The
+# worker-token branch in get_user_id is restricted to these routes so a
+# job-scoped worker credential can't be used to authenticate as the job's
+# owner on unrelated routes (e.g. cancel/delete) with a matching {job_id}.
+_WORKER_CALLBACK_ROUTES: frozenset = frozenset({
+    ("GET", "get_job_info"),
+    ("POST", "set_job_started"),
+    ("POST", "set_job_success"),
+    ("POST", "set_job_error"),
+    ("PUT", "write_stream"),
+})
 
 
-async def get_user_id(request: Request) -> str:
+def get_user_id(request: Request, settings: CEAServerSettings) -> Optional[str]:
+    # Return local user if local mode
     if settings.local:
         logger.info(f"Using `{LOCAL_USER_ID}`")
         return LOCAL_USER_ID
 
-    user_id = request.headers.get(USER_ID_HEADER)
-    if user_id:
-        await ensure_user_cached(user_id)
-        return user_id
+    # cea-worker subprocesses have no browser session cookies. They authenticate
+    # job callbacks (started/success/error, stream writes) with a job-scoped token
+    # instead, minted by start_job and matched against the {job_id} path param.
+    route = request.scope.get("route")
+    route_key = (request.method, route.name) if route is not None else None
+    worker_token = request.headers.get("X-CEA-Worker-Token")
+    job_id = request.path_params.get("job_id")
+    if job_id is not None and route_key in _WORKER_CALLBACK_ROUTES:
+        if worker_token is None:
+            logger.warning(
+                f"Worker callback for job {job_id} on {route_key} had no X-CEA-Worker-Token header. "
+                f"Header keys present: {list(request.headers.keys())}"
+            )
+        else:
+            worker_user_id = verify_worker_token(worker_token, job_id)
+            if worker_user_id is not None:
+                return worker_user_id
+            logger.warning(
+                f"Worker callback for job {job_id} on {route_key} presented a token that failed verification "
+                f"(token prefix: {worker_token[:12]}...)"
+            )
 
-    logger.info(f"Unable to determine current user, using `{LOCAL_USER_ID}`")
-    return LOCAL_USER_ID
+    # Resolve cookie-based auth directly (not as a Depends param) so worker
+    # requests -- which never carry cookies -- don't unconditionally trigger
+    # get_auth_client()'s "Unable to determine auth client" log on every call.
+    auth_client = get_auth_client(request, settings)
+    if auth_client is not None:
+        try:
+            return auth_client.get_user_id()
+        except CEAAuthError as e:
+            logger.error(e)
+
+    # No valid session
+    return None
 
 
-async def get_user(request: Request) -> Dict[str, str]:
+def get_user(auth_client: CEAAuthClient, settings: CEAServerSettings) -> Dict[str, str]:
     if settings.local:
         return {'id': LOCAL_USER_ID}
 
-    user_id = request.headers.get(USER_ID_HEADER)
-    if user_id:
-        await ensure_user_cached(user_id)
-        return {
-            'id': user_id,
-            'primary_email': request.headers.get(USER_EMAIL_HEADER) or "unknown@example.com",
-            'display_name': request.headers.get(USER_NAME_HEADER) or "Unknown User",
-        }
+    # Try to get user id from request cookie
+    if auth_client is not None:
+        try:
+            user = auth_client.get_current_user()
+            if user.get("client_read_only_metadata") is None:
+                user["onboarded"] = False
+                user["pro_user"] = False
+            else:
+                user["onboarded"] = user['client_read_only_metadata'].get("onboarded", False)
+                user["pro_user"] = user['client_read_only_metadata'].get("pro_user", False)
+            return user
+        except CEAAuthError as e:
+            logger.error(e)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=str(e),
+            )
 
-    logger.info(f"Unable to determine current user, using `{LOCAL_USER_ID}`")
-    return {'id': LOCAL_USER_ID}
+    # No valid session
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authentication required.",
+    )
 
 
-def check_auth_for_demo(request: Request, user_id: CEAUserID):
-    """Check if user is authorized when not in local mode"""
-    # Pass if local mode
+def get_auth_client(request: Request, settings: CEAServerSettings) -> Optional[AuthClient]:
+    if settings.local:
+        return None
+
+    auth_client = StackAuth.from_request_cookies(request.cookies)
+    if auth_client.access_token is not None:
+        return auth_client
+
+    logger.debug("Unable to determine auth client")
+    return None
+
+
+# Routes publicly accessible without authentication in non-local mode.
+# Every other route is gated by require_authenticated (applied at app level).
+_PUBLIC_ROUTES: frozenset = frozenset({
+    "/user/session/refresh",  # token refresh — must work with an expired access token
+    "/user/logout",           # session teardown — should work even if token is stale
+    "/server/alive",          # health check — monitoring must not need a session
+    "/server/version",        # version info — safe to expose publicly
+})
+
+# Path prefixes exempt from session auth. The route handler is responsible for
+# its own auth when its path matches one of these prefixes.
+_PUBLIC_ROUTE_PREFIXES: tuple = (
+    "/downloads/",  # pre-signed token downloads — anchor tags don't send cookies
+)
+
+
+def require_authenticated(request: Request, user_id: CEAUserID, settings: CEAServerSettings):
+    """App-level auth guard: every route requires an authenticated user in non-local mode.
+
+    In local (single-user desktop) mode this is a no-op — all routes are open.
+    In non-local mode any caller that resolves to None (no valid session token
+    present) receives 401.
+
+    Routes in _PUBLIC_ROUTES / _PUBLIC_ROUTE_PREFIXES are explicitly excluded.
+    No proxy is assumed — the server self-enforces auth.
+    """
     if settings.local:
         return
-
-    # Check if user is authorized
-    if user_id == LOCAL_USER_ID:
-        logger.info(f"Unauthorized access \"{request.method} {request.url.path}\": `{user_id}`")
+    if request.url.path in _PUBLIC_ROUTES:
+        return
+    if request.url.path.startswith(_PUBLIC_ROUTE_PREFIXES):
+        return
+    if user_id is None:
+        safe_path = request.url.path.replace("\r", "\\r").replace("\n", "\\n")
+        logger.info('Unauthenticated access "%s %s"', request.method, safe_path)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized",
+            detail="Authentication required.",
         )
 
 def get_limits(user: CEAUser) -> LimitSettings:
@@ -297,17 +311,16 @@ def get_limits(user: CEAUser) -> LimitSettings:
     return limits
 
 
-CEAUserID = Annotated[str, Depends(get_user_id)]
+CEAUserID = Annotated[Optional[str], Depends(get_user_id)]
 CEAUser = Annotated[dict, Depends(get_user)]
-CEAConfig = Annotated[Union[CEALocalConfig, CEADatabaseConfig], Depends(get_cea_config)]
+CEAConfig = Annotated[cea.config.Configuration, Depends(get_cea_config)]
 CEAProjectInfo = Annotated[ProjectInfo, Depends(get_project_info)]
-CEAProjectID = Annotated[str, Depends(get_project_id)]
 CEAPlotCache = Annotated[dict, Depends(get_plot_cache)]
 CEAWorkerProcesses = Annotated[AsyncDictCache, Depends(get_worker_processes)]
 CEAStreams = Annotated[AsyncDictCache, Depends(get_streams)]
 CEAServerUrl = Annotated[str, Depends(get_server_url)]
 CEAProjectRoot = Annotated[Optional[str], Depends(get_project_root)]
 CEAServerSettings = Annotated[Settings, Depends(get_settings)]
+CEAAuthClient = Annotated[AuthClient, Depends(get_auth_client)]
 CEAServerLimits = Annotated[LimitSettings, Depends(get_limits)]
 
-CEASeverDemoAuthCheck = Depends(check_auth_for_demo)

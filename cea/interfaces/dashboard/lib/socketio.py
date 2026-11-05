@@ -1,17 +1,31 @@
 import asyncio
-from typing import Any, Optional
+from typing import Dict, Any
 
 import socketio
 
 from socketio.exceptions import ConnectionRefusedError
 
-from cea.interfaces.dashboard.dependencies import settings
+from cea.interfaces.dashboard.lib.auth import CEAAuthError
+from cea.interfaces.dashboard.lib.auth.providers import StackAuth
 from cea.interfaces.dashboard.lib.cache.settings import cache_settings
-from cea.interfaces.dashboard.lib.database.models import LOCAL_USER_ID, ensure_user_cached
+from cea.interfaces.dashboard.lib.database.models import LOCAL_USER_ID
 from cea.interfaces.dashboard.lib.logs import getCEAServerLogger
 from cea.interfaces.dashboard.settings import get_settings
 
-logger = getCEAServerLogger("cea-server-socketio")
+logger = getCEAServerLogger("cea-socketio")
+
+class _RedisManagerLogger:
+    """Downgrades python-socketio's INFO-level manager logs (e.g. "backend
+    initialized") to DEBUG."""
+
+    def __init__(self):
+        self._wrapped = getCEAServerLogger("cea-socketio-redis")
+
+    def info(self, msg, *args, **kwargs):
+        self._wrapped.debug(msg, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
 
 
 def _get_cors_origin():
@@ -20,17 +34,34 @@ def _get_cors_origin():
     if cors_origin == '*':
         return []
 
-    return cors_origin
+    # Parse comma-separated origins into a list, matching app.py's REST CORS
+    # parsing — python-socketio treats a raw comma-joined string as a single
+    # literal origin, so without this a second origin silently breaks
+    # websocket CORS for every origin, not just the new one.
+    return [o.strip() for o in cors_origin.split(",")]
 
 
 def _get_client_manager():
     if cache_settings.host and cache_settings.port:
         try:
+            redis_options = {
+                # redis-py 8.0+ defaults socket_timeout to 5s (changed from None in v6).
+                # Pub/sub listen() is a blocking generator that indefinitely waits for messages.
+                # With socket_timeout=5, any idle period >5s raises TimeoutError and triggers reconnect loops.
+                # socket_timeout=None = indefinite wait (correct for blocking pub/sub operations).
+                # socket_connect_timeout=5 = still bounds initial connection (prevents hung connections).
+                # health_check_interval=30 = periodic PING to detect dead connections without timeouts.
+                'socket_timeout': None,
+                'socket_connect_timeout': 5,
+                'health_check_interval': 30,
+            }
             mgr = socketio.AsyncRedisManager(f'redis://{cache_settings.host}:{cache_settings.port}',
                                              write_only=False,  # Ensure reading is enabled
                                              channel='socketio',  # Use a consistent channel name
+                                             logger=_RedisManagerLogger(),
+                                             redis_options=redis_options,
                                              )
-            logger.info(f'Using Redis as message broker [{cache_settings.host}:{cache_settings.port}]')
+            logger.debug(f'Using Redis as message broker [{cache_settings.host}:{cache_settings.port}]')
             return mgr
         except Exception as e:
             logger.error(f"Failed to connect to Redis: {str(e)}")
@@ -44,7 +75,15 @@ sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins=_get_cors_ori
 socket_app = socketio.ASGIApp(sio)
 
 
-async def emit_with_retry(event: str, data: Any, room: Optional[str] = None, max_retries: int = 3,
+def init_socketio_manager() -> None:
+    if client_manager is None:
+        return
+
+    sio.manager.initialize()
+    sio.manager_initialized = True
+
+
+async def emit_with_retry(event: str, data: Any, room: str | None = None, max_retries: int = 3,
                           initial_delay: float = 0.1, backoff_factor: float = 2.0):
     """
     Emit a socketio event with retry logic and exponential backoff.
@@ -92,20 +131,36 @@ async def emit_with_retry(event: str, data: Any, room: Optional[str] = None, max
     return False
 
 
+def cookie_string_to_dict(cookie_string: str) -> Dict[str, str]:
+    token_string = cookie_string.split('; ')
+    token_string = [x for x in token_string if x.startswith(StackAuth.cookie_prefix)]
+    return {k: v for k, v in (x.split('=', 1) for x in token_string)}
+
+
 @sio.event
 async def connect(sid, environ, auth):
-    if settings.local:
+    if get_settings().local:
         await sio.enter_room(sid, f"user-{LOCAL_USER_ID}")
         return True
 
-    # Auth is handled upstream by oauth2-proxy; the user id is forwarded
-    # via the X-Auth-Request-User header by the traefik ForwardAuth middleware.
-    user_id = environ.get('HTTP_X_FORWARDED_USER')
-    if not user_id:
-        logger.error('authentication failed: no forwarded user header')
-        raise ConnectionRefusedError('authentication failed. no forwarded user header')
+    cookie_string = environ.get('HTTP_COOKIE')
+    if cookie_string is None:
+        logger.error('authentication failed')
+        raise ConnectionRefusedError('authentication failed. no cookie found')
 
-    await ensure_user_cached(user_id)
+    cookie_dict = cookie_string_to_dict(cookie_string)
+    if len(cookie_dict.keys()) == 0:
+        logger.error('unable to find token')
+        raise ConnectionRefusedError('authentication failed. no token found')
+
+    auth_client = StackAuth.from_request_cookies(cookie_dict)
+
+    try:
+        user_id = auth_client.get_user_id()
+    except CEAAuthError:
+        logger.error('unable to determine user id')
+        raise ConnectionRefusedError('authentication failed. invalid token')
+
     await sio.enter_room(sid, f"user-{user_id}")
 
     return True

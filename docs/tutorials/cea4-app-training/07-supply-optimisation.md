@@ -1,6 +1,6 @@
 # Energy Supply System Optimisation
 
-Supply system optimisation features use multi-objective optimisation algorithms to find optimal energy system configurations that balance cost, emissions, and energy consumption. The optimisation can be performed at building scale (decentralised) or district scale (centralised).
+Supply system features evaluate energy system configurations against cost, emissions, and energy consumption. Building scale (decentralised) compares a fixed set of configurations per building; district scale (centralised) uses a multi-objective genetic algorithm.
 
 ---
 
@@ -9,56 +9,43 @@ Supply system optimisation features use multi-objective optimisation algorithms 
 ⚠️ **Note**: This feature is only available via **Command Line Interface (CLI)**. It is not accessible through the CEA-4 App dashboard.
 
 ### Overview
-Optimises decentralised energy supply systems for individual buildings. The feature explores combinations of conversion technologies (boilers, heat pumps, chillers, etc.) and renewable energy sources (PV, solar thermal, geothermal) to find cost-effective and low-carbon solutions for each building independently.
+Evaluates decentralised energy supply systems for individual buildings. There is no search algorithm: for each building, CEA simulates a fixed set of heating and cooling supply configurations, compares them one-to-one, and flags the best one. Each building is treated independently, as if it were disconnected from any district network.
 
 ### When to Use
 - Designing building-level energy systems
 - Comparing retrofit options for existing buildings
-- Finding optimal technology combinations
 - Supporting building-level investment decisions
 - When district systems are not feasible
 
-### What It Optimises
+### What It Evaluates
 
-**Decision Variables**:
-- Heating system type and capacity (boiler, heat pump, etc.)
-- Cooling system type and capacity (chiller, heat pump, etc.)
-- DHW system configuration
-- PV system size and placement
-- Solar thermal system size
-- Battery storage size (optional)
-- Thermal storage size (optional)
+**Heating** (13 configurations per building):
+- Natural gas boiler
+- Biogas boiler
+- Fuel cell
+- Ground-source heat pump with natural gas backup boiler, at ten heat pump / boiler capacity splits. Configurations whose heat pump exceeds what the building's footprint area allows for boreholes are disqualified
 
-**Objectives**:
-1. **Minimize total annualised cost** (CAPEX + OPEX)
-2. **Minimize GHG emissions** (operational)
-3. **Minimize primary energy consumption**
+**Cooling** (6 configurations per building):
+- Direct expansion / mini-split (not fully built yet)
+- Vapour compression chiller with cooling tower
+- Flat-plate or evacuated-tube solar collectors with a single-effect absorption chiller, boiler and cooling tower
+- Combinations that supply the sensible cooling load separately from the air-handling / recirculation load
+
+**How the best configuration is chosen**: configurations are ranked separately by total annualised cost (TAC) and by GHG emissions. The configuration with the best combined rank is flagged as `Best configuration`. If the rank is tied, the configuration with the lowest compounded relative cost and emissions is chosen (a random pick only if those are identical too).
 
 ### Prerequisites
-- **Energy Demand Part 2** - Building energy loads required
-- **Renewable energy assessments** (optional but recommended):
-  - PV potential
-  - Solar thermal potential
-  - Geothermal potential
-
-### Required Input Files
-- Total demand summary (building loads)
-- Cost and emission databases
-- Technology databases
-- Renewable energy potential files (if available)
+- **Energy Demand Part 2** - `Total_demand.csv` and building loads
+- **Solar collector potential (SC1 flat plate and SC2 evacuated tube)** for every building with a cooling load - the cooling calculation reads both
+- Building supply properties, zone geometry and a weather file (used for the ground-source heat pump)
 
 ### Key Parameters
 
 | Parameter | Description | Typical Value |
 |-----------|-------------|---------------|
-| **Optimisation algorithm** | NSGA-II or other | NSGA-II |
-| **Population size** | Number of solutions per generation | 100-200 |
-| **Number of generations** | Iterations | 50-100 |
-| **Allow heat pumps** | Include HP in technology options | Yes |
-| **Allow boilers** | Include boilers | Yes |
-| **Allow solar** | Include solar technologies | Yes |
-| **Allow storage** | Include thermal/battery storage | Optional |
 | **Multiprocessing** | Parallel evaluation | Enabled |
+| **Number of CPUs to keep free** | CPUs left free for other work | 1 |
+
+No other parameters: technology data come from the scenario's supply-system databases.
 
 ### How to Use
 
@@ -66,99 +53,58 @@ Optimises decentralised energy supply systems for individual buildings. The feat
 
 1. **Complete prerequisites**:
    - ✅ Energy Demand Part 2
-   - ✅ (Optional) Renewable energy assessments
+   - ✅ Solar collector potential (SC1 and SC2)
 
 2. **Run via CLI**:
    ```bash
-   cea decentralized-building-main --scenario /path/to/scenario
+   cea decentralized --scenario /path/to/scenario
    ```
 
 3. **Configure parameters** (optional):
-   - Edit `cea.config` file in your scenario folder
-   - Or pass parameters via command line flags
-   - Key parameters: population size, generations, technology options
+   - Only `--multiprocessing` and `--number-of-cpus-to-keep-free`
    - Enable multiprocessing (strongly recommended)
 
-4. **Processing time**: 30 minutes to 4 hours depending on:
-   - Number of buildings
-   - Population size × generations
-   - Technology options enabled
-   - CPU cores available
+4. **Processing time**: Depends mainly on the number of buildings and available CPU cores. Each building is simulated independently, so multiprocessing helps directly.
 
 ### Output Files
 
-**Pareto optimal solutions**: `{scenario}/outputs/data/optimisation/decentralized/pareto_solutions.csv`
-- Non-dominated solutions (cost-emission trade-offs)
-- Technology configurations for each solution
-- Costs, emissions, and energy metrics
-- System capacities
+> **Note the folder spelling.** Results are written to `outputs/data/optimization/decentralized/` with a
+> **z**, even though the feature is named with an "s" elsewhere in the app.
 
-**Individual building results**: `{scenario}/outputs/data/optimisation/decentralized/BXXX_optimal_systems.csv`
-- Optimal system configuration for each building
-- Equipment sizing (kW)
-- Annual costs and emissions
-- Energy generation/consumption
+All files are in `{scenario}/outputs/data/optimization/decentralized/`, one set per building:
 
-**Summary statistics**: `{scenario}/outputs/data/optimisation/decentralized/optimisation_summary.csv`
-- Best solutions by objective
-- Min cost solution
-- Min emissions solution
-- Compromise solutions
+| File | Content |
+|------|---------|
+| `BXXX_AHU_ARU_SCU_result_cooling.csv` | One row per cooling configuration: capacities, CAPEX, OPEX, GHG emissions, TAC, and a `Best configuration` flag |
+| `BXXX_AHU_ARU_SCU_cooling_activation.csv` | Hourly activation of the best cooling configuration |
+| `DiscOp_BXXX_result_heating.csv` | One row per heating configuration: capacities, CAPEX, OPEX, GHG emissions, TAC, and a `Best configuration` flag |
+| `DiscOp_BXXX_result_heating_activation.csv` | Hourly activation of the best heating configuration |
 
 ### Understanding Results
 
-#### Pareto Frontier
-The Pareto frontier shows trade-offs between objectives:
-- **Lower-left**: Best solutions (low cost, low emissions)
-- **Extreme points**: Single-objective optima (pure cost or pure emissions focus)
-- **Middle**: Balanced compromise solutions
-
-Typical findings:
-- **Min cost**: Often gas boiler + some PV
-- **Min emissions**: Heat pump + large PV + storage
-- **Compromise**: Heat pump + moderate PV
-
-#### Technology Selection Patterns
-
-**Cost-optimal systems** typically include:
-- Gas/oil boilers (if gas is cheap)
-- Air-source heat pumps (moderate climates)
-- Minimal renewable energy
-- Small or no storage
-
-**Emissions-optimal systems** typically include:
-- Heat pumps (all-electric)
-- Maximum feasible PV
-- Thermal and/or battery storage
-- Solar thermal for DHW
+- Compare configurations within one building using the `TAC_USD` and `GHG_tonCO2` columns; the flagged best configuration is a compromise between the two rankings, not a Pareto front.
+- Building-scale results are not Pareto optimisation results, so they are not used by **Plot - Pareto Front**.
 
 ### Tips
-- **Start with smaller population/generations** for testing (e.g., 50×25)
-- **Increase for final results** (e.g., 200×100 for publication)
-- **Enable multiprocessing**: Reduces time from days to hours
-- **Constrain technologies** if some are not feasible at your site
-- **Review multiple Pareto solutions**: Understand trade-off space
+- **Enable multiprocessing**: Buildings are simulated independently, so runs scale with available CPU cores
+- **Keep a few CPUs free** so your machine stays responsive during long runs
+- **Compare all rows**, not just the flagged best, if you care about a specific trade-off between cost and emissions
 
 ### Troubleshooting
 
+**Issue**: Run fails with a missing file (e.g. solar collector results)
+- **Solution**: Run the solar collector potential for both SC1 and SC2 first, and Energy Demand Part 2
+
 **Issue**: Optimisation runs very slowly
-- **Solution**: Reduce population size or generations for testing
 - **Solution**: Enable multiprocessing
-- **Solution**: Reduce number of technology options
+- **Solution**: Test on a scenario with fewer buildings first
 
-**Issue**: No feasible solutions found
-- **Solution**: Relax constraints (e.g., allow more technology types)
-- **Solution**: Check demand data is valid
-- **Solution**: Verify cost/performance databases
-
-**Issue**: All solutions look similar
-- **Solution**: Increase population diversity (larger population)
-- **Solution**: Run for more generations
-- **Solution**: Expand technology options
+**Issue**: A heat pump configuration is missing or marked as not best
+- **Solution**: Heat pump sizes are limited by the building's footprint area (borehole space); larger heat pump shares are disqualified for small footprints
 
 ---
 
-## Supply System Optimisation: District-Scale
+## District Supply System Optimisation
 
 ### Overview
 Optimises centralised energy supply systems for entire districts. This feature finds optimal configurations for central plants, distribution networks, and building substations, considering both individual building requirements and district-level synergies.
@@ -182,9 +128,11 @@ Optimises centralised energy supply systems for entire districts. This feature f
 - Energy import/export strategies
 
 **Objectives**:
-1. **Minimize total system cost** (CAPEX + OPEX + network)
-2. **Minimize total GHG emissions**
-3. **Minimize primary energy consumption**
+Any combination selected under **Objective functions**:
+1. **Minimise cost** (`cost`)
+2. **Minimise GHG emissions** (`GHG_emissions`)
+3. **Minimise system energy demand** (`system_energy_demand`)
+4. **Minimise anthropogenic heat** (`anthropogenic_heat`)
 
 ### Additional Complexity vs Building-Scale
 
@@ -210,15 +158,18 @@ District optimisation must account for:
 
 | Parameter | Description | Typical Value |
 |-----------|-------------|---------------|
-| **Optimisation algorithm** | Evolutionary algorithm | NSGA-II or similar |
-| **Population size** | Solutions per generation | 100-300 |
-| **Number of generations** | Optimisation iterations | 50-150 |
-| **Allow district heating** | Include DH network option | Optional |
-| **Allow district cooling** | Include DC network option | Optional |
-| **Allow CHP** | Include combined heat & power | Optional |
-| **Allow thermal storage** | Include storage at plant | Yes |
-| **Network layout** | Use existing or optimise | From Part 1 or optimise |
-| **Multiprocessing** | Parallel evaluation | Enabled |
+| **Network name** | Existing network layout for the base case, or (none) to auto-generate one from Input Editor > supply | From Thermal Network Part 1 |
+| **Network type** | District heating or district cooling | DH / DC |
+| **Buildings** | Buildings to include. Leave blank for all | All |
+| **Cooling / heating / heat rejection components** | Technology categories to consider, in priority order (e.g. BOILERS, COGENERATION_PLANTS, HEAT_PUMPS) | Defaults |
+| **Maximum number of networks** | Maximum thermal networks generated across the district | 2 |
+| **Objective functions** | `cost`, `GHG_emissions`, `system_energy_demand`, `anthropogenic_heat` | Two or three objectives |
+| **Available energy sources / potentials** | Unlimited carriers (grid, fossil, bio fuels) and local potentials (PV, PVT, SC, geothermal, water bodies, sewage) | Defaults |
+| **Systems / networks algorithm** | Genetic algorithm used for supply systems and networks | NSGAIII |
+| **GA population size** | Individuals per generation. Leave blank for the NSGA-III suggestion (92) | Blank |
+| **GA number of generations** | Optimisation iterations | 3 (test) / more for real studies |
+| **Generate detailed outputs** | Write hourly supply-system profiles | false |
+| **Retain run results** | Keep this run instead of overwriting it next time | false |
 
 ### How to Use
 
@@ -230,9 +181,10 @@ District optimisation must account for:
 2. **Configure optimisation**:
    - Navigate to **Energy Supply System Optimisation**
    - Select **District Supply System Optimisation**
-   - Enable desired system options (DH, DC, CHP, storage, etc.)
-   - Set population and generation parameters
-   - Configure multiprocessing
+   - Select the network layout and network type (DH or DC)
+   - Choose the heating, cooling and heat rejection components, energy sources and potentials
+   - Choose the objective functions
+   - Set GA population size and number of generations
 
 3. **Run optimisation**:
    - Click **Run**
@@ -245,28 +197,31 @@ District optimisation must account for:
 
 ### Output Files
 
-**Pareto frontier**: `{scenario}/outputs/data/optimisation-new/pareto_optimal_solutions.csv`
-- Non-dominated system configurations
-- Cost, emissions, and energy for each solution
-- Network configurations
-- Plant capacities and locations
+All district results live under
+`{scenario}/outputs/data/optimization/centralized/{DES_id}/`, where `{DES_id}` identifies one
+near-Pareto-optimal district energy system (`current_DES` for the base case). Each candidate
+system gets its own folder, so the Pareto set is a set of *folders* rather than one file.
 
-**Optimal system configurations**: `{scenario}/outputs/data/optimisation-new/optimal_supply_systems_summary.csv`
-- Detailed technology mix for each Pareto solution
-- Equipment types and capacities
-- Network characteristics
+> **Note the folder spelling**: `optimization` with a **z**.
+
+**Supply systems summary**: `.../{DES_id}/Supply_systems/Supply_systems_summary.csv`
+- Technology mix, equipment types and capacities for that district energy system
 - Annual performance metrics
 
-**Building connections**: `{scenario}/outputs/data/optimisation-new/building_connections.csv`
-- Which buildings connect to district systems (per solution)
-- Substation sizing
-- Connection costs
+**Individual supply system structure**: `.../{DES_id}/Supply_systems/{system_id}_supply_system_structure.csv`
+- One file per network (`N0000`) or standalone building (`B0000`)
 
-**Hourly operation** (for selected solutions): `{scenario}/outputs/data/optimisation-new/hourly_operation/`
-- Plant dispatch schedules
-- Storage operation
-- Network flows
-- Import/export profiles
+**Network layout**: `.../{DES_id}/networks/{network_id}_layout.geojson`
+- The optimised network geometry
+
+**Network performance**: `.../{DES_id}/Supply_system_operation_details/network_performance.csv`
+- Detailed thermal and hydraulic performance of the networks
+
+**Hourly operation**: `.../{DES_id}/Supply_system_operation_details/{system_id}_operation.csv`
+- Plant dispatch and storage operation, hour by hour
+
+**Annual breakdown**: `.../{DES_id}/Supply_system_operation_details/{system_id}_annual_breakdown.csv`
+- Annual energy demand, generation and losses per system
 
 ### Understanding Results
 
@@ -364,7 +319,7 @@ Best practice workflow:
 
 ## Optimisation Best Practices
 
-### Parameter Selection
+### Parameter Selection (district-scale)
 - **Testing**: 50 population × 25 generations (~1,000 evaluations)
 - **Production**: 200 population × 100 generations (~20,000 evaluations)
 - **Publication**: 300 population × 150 generations (~45,000 evaluations)

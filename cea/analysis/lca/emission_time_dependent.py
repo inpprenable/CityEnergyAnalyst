@@ -1,20 +1,23 @@
+import csv
+import difflib
 import os
+import unicodedata
 import warnings
 
 import numpy as np
 import pandas as pd
 from pandas.errors import EmptyDataError, ParserError
 
-from cea.analysis.lca.emission_timeline import BuildingEmissionTimeline
+from cea.analysis.lca.emission_timeline import BuildingYearlyEmissionTimeline as BuildingEmissionTimeline
 from cea.analysis.lca.hourly_operational_emission import OperationalHourlyTimeline
 from cea.config import Configuration
 from cea.constants import HOURS_IN_YEAR
 from cea.datamanagement.database.components import Feedstocks
-from cea.datamanagement.database.envelope_lookup import EnvelopeLookup
 from cea.demand.building_properties import BuildingProperties
 from cea.inputlocator import InputLocator
 from cea.technologies.energy_carriers import electricity_carrier
 from cea.utilities import epwreader
+from cea.scripts import tool_ref
 
 __author__ = "Yiqiao Wang, Zhongming Shi"
 __copyright__ = "Copyright 2025, Architecture and Building Systems - ETH Zurich"
@@ -24,6 +27,102 @@ __version__ = "0.1"
 __maintainer__ = "Reynold Mok"
 __email__ = "cea@arch.ethz.ch"
 __status__ = "Production"
+
+
+def _normalize_column_name(name: str) -> str:
+    """Normalize a column name for lenient matching: strip whitespace and fold
+    Unicode look-alikes (e.g. subscript '₂' -> '2') via NFKC, so a name typed
+    without special characters can still match a header that has them."""
+    return unicodedata.normalize("NFKC", name).strip()
+
+
+_CSV_DELIMITER_CANDIDATES = ',;\t|'
+
+# UnicodeDecodeError is a ValueError, not an OSError, so it needs its own handler; pandas' own
+# message ("'utf-8' codec can't decode byte ...") gives the user nothing to act on.
+_NOT_UTF8_MESSAGE = (
+    "Could not read '{basename}': the file is not UTF-8 encoded. "
+    "Save it again as 'CSV UTF-8 (Comma delimited)' and re-upload it."
+)
+
+
+def _sniff_csv_delimiter(csv_path: str) -> str:
+    """Detect the field delimiter of `csv_path` from a sample of its own bytes.
+
+    A file exported with a semicolon or tab delimiter (e.g. from a European-locale
+    spreadsheet) parsed with pandas' default comma separator doesn't fail -- with no comma
+    to split on, the whole header line is silently read as one garbled column name (containing
+    the literal delimiter), so the user never sees a clear error.
+
+    Falls back to ',' (pandas' own default) if the file can't be sampled or no delimiter
+    among `_CSV_DELIMITER_CANDIDATES` can be confidently detected -- e.g. a single-column
+    file has no delimiter to find, which is not an error.
+    """
+    try:
+        with open(csv_path, newline='', encoding='utf-8-sig') as f:
+            sample = f.read(4096)
+    except (OSError, UnicodeDecodeError):
+        return ','
+
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=_CSV_DELIMITER_CANDIDATES).delimiter
+    except csv.Error:
+        return ','
+
+
+def _resolve_grid_intensity_column(csv_path: str, requested_name: str) -> tuple[str, str]:
+    """Resolve the user-provided column name against the CSV's actual header row.
+
+    Tries an exact match first, then a lenient match (Unicode-normalised,
+    whitespace-stripped) if that resolves to exactly one column -- this
+    tolerates a column name typed without special characters (e.g. 'gCO2eq'
+    for a header using the subscript '₂') or with trailing whitespace copied
+    along with it.
+
+    The header is parsed with a sniffed delimiter (see `_sniff_csv_delimiter`), not pandas'
+    default comma, so a semicolon/tab-delimited file resolves normally instead of presenting
+    its whole header line as a single unmatched "column".
+
+    Returns (resolved_column_name, delimiter) -- the caller must reuse `delimiter` when
+    reading the actual data, or it would parse against the wrong separator again.
+
+    Raises ValueError listing the file's available columns (and close-match
+    suggestions) when nothing resolves. Errors report the file's basename
+    only: the on-disk path is a server-side temp file the user never sees.
+    """
+    basename = os.path.basename(csv_path)
+    delimiter = _sniff_csv_delimiter(csv_path)
+    try:
+        header = pd.read_csv(csv_path, nrows=0, sep=delimiter)
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"Could not find the provided CSV file '{basename}'.") from e
+    except PermissionError as e:
+        raise PermissionError(
+            f"Permission denied reading '{basename}'. It may be open in another program."
+        ) from e
+    except UnicodeDecodeError as e:
+        raise ValueError(_NOT_UTF8_MESSAGE.format(basename=basename)) from e
+    except (EmptyDataError, ParserError, OSError) as e:
+        raise ValueError(f"Could not parse '{basename}': {e}") from e
+
+    columns = list(header.columns)
+    if requested_name in columns:
+        return requested_name, delimiter
+
+    normalized_requested = _normalize_column_name(requested_name)
+    normalized_matches = [c for c in columns if _normalize_column_name(c) == normalized_requested]
+    if len(normalized_matches) == 1:
+        return normalized_matches[0], delimiter
+
+    available = ', '.join(f"'{c}'" for c in columns)
+    message = (
+        f"Column '{requested_name}' was not found in '{basename}'. "
+        f"Available columns: {available}."
+    )
+    suggestions = difflib.get_close_matches(requested_name, columns, n=3)
+    if suggestions:
+        message += f" Did you mean: {', '.join(repr(s) for s in suggestions)}?"
+    raise ValueError(message)
 
 
 def _load_grid_emission_intensity_override(config: Configuration):
@@ -47,28 +146,30 @@ def _load_grid_emission_intensity_override(config: Configuration):
         return False, None
     if not intensity_column_name:
         raise ValueError(
-            "If grid_carbon_intensity_dataset_csv is provided, csv_carbon_intensity_column_name must also be provided."
+            "If grid_carbon_intensity_dataset_csv is provided, csv_carbon_intensity_column_name must also be provided. "
+            f"Select the column of '{os.path.basename(intensity_csv_path)}' that holds the grid carbon intensity."
         )
+
+    basename = os.path.basename(intensity_csv_path)
+    resolved_column_name, delimiter = _resolve_grid_intensity_column(intensity_csv_path, intensity_column_name)
 
     try:
         series: pd.Series = pd.read_csv(
             intensity_csv_path,
-            usecols=[intensity_column_name],
-            dtype={intensity_column_name: "float64"},
-        )[intensity_column_name]
-    except FileNotFoundError as e:
-        raise FileNotFoundError(
-            f"Could not find the provided CSV file '{intensity_csv_path}'."
-        ) from e
-    except PermissionError as e:
-        raise PermissionError(
-            f"Permission denied reading '{intensity_csv_path}'. It may be open in another program."
-        ) from e
-    except (EmptyDataError, ParserError, OSError, ValueError) as e:
+            sep=delimiter,
+            usecols=[resolved_column_name],
+        )[resolved_column_name]
+    except UnicodeDecodeError as e:
+        # the header decoded but a later row did not
+        raise ValueError(_NOT_UTF8_MESSAGE.format(basename=basename)) from e
+    except (EmptyDataError, ParserError, OSError) as e:
         raise ValueError(
-            f"Could not parse '{intensity_csv_path}' with column '{intensity_column_name}': {e}"
+            f"Could not parse '{basename}' with column '{resolved_column_name}': {e}"
         ) from e
 
+    # Row-count check and the Feb 29 drop happen BEFORE numeric/NaN validation below: Feb 29
+    # is discarded either way to produce the target 8760-hour year, so garbage or missing
+    # values there must not block loading a file that is otherwise perfectly usable.
     n = len(series)
     if n == 8760:
         pass
@@ -84,10 +185,21 @@ def _load_grid_emission_intensity_override(config: Configuration):
             f"Emission intensity dataset CSV file must have 8760 or 8784 rows, but has {n} rows."
         )
 
+    # Values must be numeric; a non-numeric column (e.g. an id or label column)
+    # fails a clean float conversion rather than silently coercing to NaN.
+    try:
+        series = series.astype("float64")
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"Column '{resolved_column_name}' in '{basename}' contains non-numeric values: {e}"
+        ) from e
+
     if series.isna().any():
         na_count = int(series.isna().sum())
+        first_rows = series.index[series.isna()][:5].tolist()
         raise ValueError(
-            f"Emission intensity contains {na_count} NaN values; please clean or impute the data."
+            f"Column '{resolved_column_name}' in '{basename}' has {na_count} empty values "
+            f"out of {len(series)} rows (first at row(s) {first_rows}); please clean or impute the data."
         )
 
     return True, series.to_numpy(dtype=float)
@@ -129,7 +241,7 @@ def operational_hourly(config: Configuration) -> None:
             missing_list = ', '.join(missing_panels)
             error_msg = (
                 f"PV electricity results missing for panel type(s): {missing_list}. "
-                f"Please run the 'photovoltaic (PV) panels' script first to generate PV potential results for these panel types."
+                f"Please run {tool_ref('photovoltaic')} first to generate PV potential results for these panel types."
             )
             print(f"ERROR: {error_msg}")
             raise FileNotFoundError(error_msg)
@@ -221,14 +333,13 @@ def total_yearly(config: Configuration) -> None:
                 missing_list = ', '.join(missing_panels)
                 error_msg = (
                     f"PV electricity results missing for panel type(s): {missing_list}. "
-                    f"Please run the 'photovoltaic (PV) panels' script first to generate PV potential results for these panel types."
+                    f"Please run {tool_ref('photovoltaic')} first to generate PV potential results for these panel types."
                 )
                 print(f"ERROR: {error_msg}")
                 raise FileNotFoundError(error_msg)
 
             print(f"  Including PV life cycle emissions for panel types: {', '.join(pv_codes)}")
 
-    envelope_lookup = EnvelopeLookup.from_locator(locator)
     weather_path = locator.get_weather_file()
     weather_data = epwreader.epw_reader(weather_path)[
         ["year", "drybulb_C", "wetbulb_C", "relhum_percent", "windspd_ms", "skytemp_C"]
@@ -238,10 +349,11 @@ def total_yearly(config: Configuration) -> None:
     for building in buildings:
         timeline = BuildingEmissionTimeline(
             building_properties=building_properties,
-            envelope_lookup=envelope_lookup,
             building_name=building,
             locator=locator,
             end_year=end_year,
+            maintenance_fraction=config.emissions.maintenance_fraction_of_production,
+            repair_fraction=config.emissions.repair_fraction_of_production,
         )
         timeline.fill_embodied_emissions()
         if consider_pv:
@@ -251,14 +363,7 @@ def total_yearly(config: Configuration) -> None:
         tar_yr = emissions_cfg.grid_decarbonise_target_year
         tar_ef = emissions_cfg.grid_decarbonise_target_emission_factor
 
-        if ref_yr is not None and tar_yr is not None and tar_ef is not None: # all exist
-            feedstock_policies_arg = {electricity_carrier(locator): (ref_yr, tar_yr, tar_ef)}
-        elif ref_yr is None and tar_yr is None and tar_ef is None: # all None
-            feedstock_policies_arg = None
-        else:
-            raise ValueError(
-                "If one of grid_decarbonise_reference_year, grid_decarbonise_target_year, or grid_decarbonise_target_emission_factor is set, all must be set."
-            )
+        feedstock_policies_arg = _build_feedstock_policies(ref_yr, tar_yr, tar_ef, electricity_carrier(locator))
         timeline.fill_operational_emissions(
             feedstock_policies=feedstock_policies_arg
         )
@@ -310,21 +415,26 @@ def sum_by_building(result_list: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame
         It has the same columns as the input dataframes.
     :rtype: pd.DataFrame
     """
-    # create a new df, each row is the summed value for a building across all its df's indices
-    columns_without_date = [col for col in result_list[0][1].columns if col not in ['date', 'name']]
+    # Create a new df: each row is the summed value for a building across all its df's indices.
+    # Only numeric columns are aggregated (e.g., ignore free-text columns like 'Note').
+    sample_df = result_list[0][1].copy()
+    sample_df = sample_df.drop(columns=[c for c in ("date", "name") if c in sample_df.columns])
+    numeric_cols = list(sample_df.select_dtypes(include="number").columns)
     summed_df = pd.DataFrame(
         data=0.0,
         index=[building for building, _ in result_list],
-        columns=columns_without_date,
+        columns=numeric_cols,
     )
     summed_df.index.rename("name", inplace=True)
     for building, df in result_list:
         df_copy = df.copy()
-        if 'date' in df_copy.columns:
-            df_copy.pop('date')
-        if 'name' in df_copy.columns:
-            df_copy.pop('name')
-        summed_df.loc[building] += df_copy.sum(axis=0).to_numpy()
+        if "date" in df_copy.columns:
+            df_copy = df_copy.drop(columns=["date"])
+        if "name" in df_copy.columns:
+            df_copy = df_copy.drop(columns=["name"])
+
+        df_numeric = df_copy.select_dtypes(include="number")
+        summed_df.loc[building] = summed_df.loc[building].add(df_numeric.sum(axis=0), fill_value=0.0)
     return summed_df
 
 
@@ -396,11 +506,46 @@ def sum_by_year(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     if not dfs:
         raise ValueError("dfs must be non-empty")
 
+    # Detect whether the DataFrames are indexed by year (Y_XXXX format)
+    has_year_index = any(
+        str(idx).startswith('Y_') for df in dfs for idx in df.index[:1]
+    )
+
     dfs_for_sum = [df.drop(columns=['name'], errors='ignore') for df in dfs]
 
-    min_year = min(int(str(df.index.min()).replace('Y_', '')) for df in dfs_for_sum)
-    max_year = max(int(str(df.index.max()).replace('Y_', '')) for df in dfs_for_sum)
-    reindex_range = [f"Y_{year}" for year in range(min_year, max_year + 1)]
+    # Create copies of dataframes without the date column for summing
+    dfs_for_sum = []
+    date_series = None
+    year_series = None
+
+    for df in dfs:
+        df_copy = df.copy()
+        if 'date' in df_copy.columns:
+            if date_series is None:
+                date_series = df_copy['date'].copy()
+            df_copy = df_copy.drop(columns=['date'])
+        if "name" in df_copy.columns:
+            df_copy = df_copy.drop(columns=['name'])
+
+        # Sum only numeric columns (ignore free-text columns like 'Note')
+        df_copy = df_copy.select_dtypes(include="number")
+
+        # Extract year values from index if it's a year index
+        if has_year_index and year_series is None:
+            year_series = pd.Series(df_copy.index.values, index=df_copy.index)
+        dfs_for_sum.append(df_copy)
+
+    # Perform the sum operation on numeric columns only
+    if has_year_index:
+        # Extract numeric years from 'Y_XXXX' formatted indices
+        min_year = min(int(str(df.index.min()).replace('Y_', '')) for df in dfs_for_sum)
+        max_year = max(int(str(df.index.max()).replace('Y_', '')) for df in dfs_for_sum)
+        reindex_range = [f"Y_{year}" for year in range(min_year, max_year + 1)]
+    else:
+        # Handle numeric indices by coercing to int
+        index_min = min(int(df.index.min()) for df in dfs_for_sum)
+        index_max = max(int(df.index.max()) for df in dfs_for_sum)
+        reindex_range = pd.RangeIndex(index_min, index_max + 1)
 
     out = (
         pd.concat(dfs_for_sum)
@@ -602,9 +747,17 @@ def _build_feedstock_policies(ref_yr, tar_yr, tar_ef, electricity_carrier_name):
         return {electricity_carrier_name: (ref_yr, tar_yr, tar_ef)}
     if ref_yr is None and tar_yr is None and tar_ef is None:
         return None
+    values = {
+        'grid_decarbonise_reference_year': ref_yr,
+        'grid_decarbonise_target_year': tar_yr,
+        'grid_decarbonise_target_emission_factor': tar_ef,
+    }
+    missing = ', '.join(name for name, value in values.items() if value is None)
+    provided = ', '.join(name for name, value in values.items() if value is not None)
     raise ValueError(
         'If one of grid_decarbonise_reference_year, grid_decarbonise_target_year, or '
-        'grid_decarbonise_target_emission_factor is set, all must be set.'
+        'grid_decarbonise_target_emission_factor is set, all must be set. '
+        f'Missing: {missing}. Either set it, or clear {provided} to skip grid decarbonisation.'
     )
 
 
@@ -627,7 +780,7 @@ def calculate_emissions_for_whatif(whatif_name: str, config: Configuration) -> N
         expected = locator.get_analysis_configuration_file(whatif_name)
         raise FileNotFoundError(
             f"configuration file not found for what-if '{whatif_name}': {expected}\n"
-            "Please run 'final-energy' first."
+            f"Please run {tool_ref('final-energy')} first."
         )
     building_configs = config_data.get('buildings', {})
     network_name = config_data.get('metadata', {}).get('network_name')
@@ -652,7 +805,7 @@ def calculate_emissions_for_whatif(whatif_name: str, config: Configuration) -> N
     if not os.path.exists(summary_path):
         raise FileNotFoundError(
             f"final_energy_buildings.csv not found for what-if '{whatif_name}': {summary_path}\n"
-            "Please run 'final-energy' first."
+            f"Please run {tool_ref('final-energy')} first."
         )
     summary_df = pd.read_csv(summary_path)
 
@@ -673,7 +826,6 @@ def calculate_emissions_for_whatif(whatif_name: str, config: Configuration) -> N
     building_rows_df = summary_df[summary_df['type'] == 'building'] if 'type' in summary_df.columns else summary_df
     building_names = building_rows_df['name'].dropna().tolist()
     building_properties = BuildingProperties(locator, weather_data, building_names)
-    envelope_lookup = EnvelopeLookup.from_locator(locator)
 
     # --- Process buildings ---
     operational_results = []   # (name, hourly_df)
@@ -718,14 +870,17 @@ def calculate_emissions_for_whatif(whatif_name: str, config: Configuration) -> N
         production_total = 0.0
         biogenic_total = 0.0
         demolition_total = 0.0
+        maintenance_total = 0.0
+        repair_total = 0.0
         operation_total = 0.0
         try:
             timeline = BuildingEmissionTimeline(
                 building_properties=building_properties,
-                envelope_lookup=envelope_lookup,
                 building_name=building_name,
                 locator=locator,
                 end_year=end_year,
+                maintenance_fraction=config.emissions.maintenance_fraction_of_production,
+                repair_fraction=config.emissions.repair_fraction_of_production,
             )
             timeline.fill_embodied_emissions()
             solar_config = supply_cfg.get('solar', {})
@@ -756,6 +911,12 @@ def calculate_emissions_for_whatif(whatif_name: str, config: Configuration) -> N
             demolition_total = float(timeline.timeline[
                 [c for c in tl_cols if c.startswith('demolition_')]
             ].sum().sum())
+            maintenance_total = float(timeline.timeline[
+                [c for c in tl_cols if c.startswith('maintenance_')]
+            ].sum().sum())
+            repair_total = float(timeline.timeline[
+                [c for c in tl_cols if c.startswith('repair_')]
+            ].sum().sum())
             operation_total = float(timeline.timeline[
                 [c for c in tl_cols if c.startswith('operation_')]
             ].sum().sum())
@@ -764,6 +925,8 @@ def calculate_emissions_for_whatif(whatif_name: str, config: Configuration) -> N
             production_total = 0.0
             biogenic_total = 0.0
             demolition_total = 0.0
+            maintenance_total = 0.0
+            repair_total = 0.0
             operation_total = 0.0
 
         buildings_rows_out.append({
@@ -778,6 +941,8 @@ def calculate_emissions_for_whatif(whatif_name: str, config: Configuration) -> N
             'operation_kgCO2e': operation_total,
             'production_kgCO2e': production_total,
             'biogenic_kgCO2e': biogenic_total,
+            'maintenance_kgCO2e': maintenance_total,
+            'repair_kgCO2e': repair_total,
             'demolition_kgCO2e': demolition_total,
             'whatif_name': whatif_name,
         })
@@ -876,6 +1041,8 @@ def calculate_emissions_for_whatif(whatif_name: str, config: Configuration) -> N
             'operation_kgCO2e': plant_op_lifecycle,
             'production_kgCO2e': 0.0,
             'biogenic_kgCO2e': 0.0,
+            'maintenance_kgCO2e': 0.0,
+            'repair_kgCO2e': 0.0,
             'demolition_kgCO2e': 0.0,
             'whatif_name': whatif_name,
         })

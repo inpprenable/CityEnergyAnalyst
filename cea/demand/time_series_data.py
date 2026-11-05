@@ -48,16 +48,7 @@ def empty_array():
 
 
 def empty_char_array():
-    """
-    Creates an empty numpy chararray of size HOURS_IN_YEAR, filled with 'unknown'.
-    
-    Uses numpy chararray for consistency with the codebase's numpy-based time series data.
-    Memory usage: ~175KB per array (itemsize=20 * 8760 hours), which is acceptable
-    for the performance benefits of vectorized operations.
-    """
-    arr = np.chararray(HOURS_IN_YEAR, itemsize=20)
-    arr[:] = AHUStatus.UNKNOWN  # Using enum default value
-    return arr
+    return np.full(HOURS_IN_YEAR, AHUStatus.UNKNOWN, dtype='U20')
 
 
 @dataclass
@@ -476,7 +467,10 @@ class RCModelTemperatures:
     """Internal air temperature [C]"""
 
     theta_m: npt.NDArray[np.float64] = field(default_factory=empty_array)
-    """Temperature of the thermal mass node (RC model) [C]"""
+    """Average temperature of the thermal mass node (RC model) during timestep t [C]"""
+
+    theta_m_t: npt.NDArray[np.float64] = field(default_factory=empty_array)
+    """Temperature of the thermal mass node (RC model) at the end of timestep t [C]"""
 
     theta_c: npt.NDArray[np.float64] = field(default_factory=empty_array)
     """Temperature of the surface node (RC model) [C]"""
@@ -645,13 +639,13 @@ class SystemStatus:
     Data related to system status.
     """
 
-    sys_status_ahu: np.chararray = field(default_factory=empty_char_array)
+    sys_status_ahu: npt.NDArray[np.str_] = field(default_factory=empty_char_array)
     """Status of the AHU (AHUStatus values)"""
 
-    sys_status_aru: np.chararray = field(default_factory=empty_char_array)
+    sys_status_aru: npt.NDArray[np.str_] = field(default_factory=empty_char_array)
     """Status of the ARU (ARUStatus values)"""
 
-    sys_status_sen: np.chararray = field(default_factory=empty_char_array)
+    sys_status_sen: npt.NDArray[np.str_] = field(default_factory=empty_char_array)
     """Status of the sensible heat recovery (SENStatus values)"""
 
 

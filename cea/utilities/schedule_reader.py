@@ -67,12 +67,50 @@ def save_cea_schedules(schedule_data, path_to_building_schedule):
     df_schedules.to_csv(path_to_building_schedule, index=False, float_format='%.2f')
 
 
-def save_cea_monthly_multipliers(lists_monthly_multiplier, path_to_monthly_multiplier):
+def save_cea_monthly_multipliers(lists_monthly_multiplier, path_to_monthly_multiplier, *, zone_buildings=None):
+    """Write the district monthly-multiplier CSV.
 
-    # monthly multiplier
+    :param zone_buildings: every building currently in the zone, regardless of whether this
+        call mapped it. When given and the file already exists with the current schema, rows
+        for buildings not in `lists_monthly_multiplier` are kept (and any no longer in
+        `zone_buildings` are dropped) instead of the file being replaced outright -- a targeted
+        remap of a handful of buildings must not delete every other building's row. `None`
+        (the default) always overwrites, for callers that already computed every zone building.
+
+    :raises ValueError: a subset remap (`zone_buildings` given, and it is not a superset of
+        `lists_monthly_multiplier`) found an existing file whose columns don't match the
+        current schema -- merging would require guessing at columns this run never computed,
+        and overwriting would silently drop every other building's row. Mirrors
+        `write_building_properties`'s handling of the same failure mode.
+    """
     header = ['name'] + months
-    df_monthly_multiplier = pd.DataFrame(data=lists_monthly_multiplier, columns=header)
-    df_monthly_multiplier.to_csv(path_to_monthly_multiplier, index=False, float_format='%.2f')
+    df_monthly_multiplier = pd.DataFrame(data=lists_monthly_multiplier, columns=header).set_index('name')
+
+    is_subset_run = not set(zone_buildings or []) <= set(df_monthly_multiplier.index)
+
+    if zone_buildings is not None and os.path.isfile(path_to_monthly_multiplier):
+        existing = pd.read_csv(path_to_monthly_multiplier)
+        # Compared as sets, matching `write_building_properties`'s treatment of the same
+        # problem for the other five derived tables (`archetypes_mapper.py`): the file on disk
+        # can store these columns in a different order than `header`.
+        if 'name' in existing.columns and set(existing.columns) == set(header):
+            existing = existing.set_index('name')
+            existing = existing.loc[existing.index.isin(zone_buildings)]
+            kept = existing.drop(index=df_monthly_multiplier.index, errors='ignore')
+            order = list(existing.index) + [n for n in df_monthly_multiplier.index if n not in existing.index]
+            df_monthly_multiplier = pd.concat([kept, df_monthly_multiplier]).reindex(order)
+        elif 'name' in existing.columns and is_subset_run:
+            # A subset run cannot safely blend into a file from an older/different CEA schema:
+            # writing just the subset under the new columns would silently delete every
+            # building this run did not touch (see `write_building_properties`'s docstring for
+            # the same failure mode). Stop rather than do that quietly. A full run has no such
+            # risk -- it is about to write every zone building regardless.
+            raise ValueError(
+                f"Cannot merge a partial monthly-multiplier re-map into "
+                f"{path_to_monthly_multiplier}: its columns do not match the current schema. "
+                f"Re-run the mapper for the whole district to rewrite it.")
+
+    df_monthly_multiplier.reset_index().to_csv(path_to_monthly_multiplier, index=False, float_format='%.2f')
 
 
 
@@ -96,8 +134,9 @@ def schedule_to_dataframe(schedule_path):
 
     schedule_data = pd.read_csv(schedule_path, skiprows=2, usecols=columns).set_index(
         ['DAY', 'HOUR']).unstack().reindex(['WEEKDAY', 'SATURDAY', 'SUNDAY'])
-    for t, df in schedule_data.groupby(axis=1, level=0, sort=False):
-        df.columns = [i for i in range(1, 25)]
+    for t in dict.fromkeys(schedule_data.columns.get_level_values(0)):
+        df = schedule_data[t].copy()
+        df.columns = range(1, 25)
         out[t] = df.reset_index()
 
     return out

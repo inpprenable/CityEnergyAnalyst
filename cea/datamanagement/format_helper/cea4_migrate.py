@@ -481,11 +481,34 @@ def csv_to_csv(scenario, item_csv, required_columns_3, columns_mapping_dict, ver
             print(f'- {item_csv}.dbf has been migrated from CEA-3 to CEA-4 format.')
 
 
+# Building-properties files that kept their CEA-4 column layout but were renamed after
+# release (e.g. `air_conditioning_systems.csv` -> `hvac.csv`). A scenario migrated to CEA-4
+# under the old name has no CEA-3 source to re-migrate from, so it needs a plain rename
+# rather than the `migrate_dbf_to_csv`/`csv_to_csv` conversion path above.
+LEGACY_CEA4_BUILDING_PROPERTIES_FILENAMES = {
+    'hvac': 'air_conditioning_systems.csv',
+    'supply': 'supply_systems.csv',
+}
+
+
+def rename_legacy_cea4_building_properties_files(scenario, verbose=False):
+    for item, legacy_filename in LEGACY_CEA4_BUILDING_PROPERTIES_FILENAMES.items():
+        current_path = path_to_input_file_without_db_4(scenario, item)
+        legacy_path = os.path.join(scenario, "inputs", "building-properties", legacy_filename)
+        if not os.path.isfile(current_path) and os.path.isfile(legacy_path):
+            os.rename(legacy_path, current_path)
+            if verbose:
+                print(f'- {legacy_filename} has been renamed to {os.path.basename(current_path)} (CEA-4 naming update).')
+
+
 ## --------------------------------------------------------------------------------------------------------------------
 ## Migrate to CEA-4 format from CEA-3 format
 ## --------------------------------------------------------------------------------------------------------------------
 
 def migrate_cea3_to_cea4(scenario, verbose=False):
+
+    # 0a. rename building-properties files that only changed name since the last CEA-4 migration
+    rename_legacy_cea4_building_properties_files(scenario, verbose=verbose)
 
     #0. verify if everything is already in the correct format for CEA-4
     dict_missing = cea4_verify(scenario)
@@ -533,12 +556,21 @@ def migrate_cea3_to_cea4(scenario, verbose=False):
                         zone_df_4 = pd.merge(zone_df_3, typology_df, left_on=['name'], right_on=["Name"], how='left')
                         zone_df_4.drop(columns=['Name'], inplace=True)
 
-                        # bring void_deck from architecture.dbf to zone.shp
+                        # bring void_deck from architecture.dbf to zone.shp, unchanged.
+                        #
+                        # It is deliberately NOT converted to `height_vd` here. The metre form
+                        # redefines `floors_ag` to count only the enclosed storeys, and
+                        # `floors_ag` is read elsewhere as the total above-ground storey count
+                        # -- `cea4_migrate_db` rescales `Ns` by
+                        # `(floors_ag + floors_bg) / floors_ag`, for one. Rewriting it here
+                        # would silently shift occupied areas and demand for every migrated
+                        # building. A CEA-3 scenario therefore stays on the legacy column, which
+                        # is fully supported; `height_vd` is for new and hand-authored scenarios.
                         if 'void_deck' not in list_missing_columns_architecture_4:
                             void_deck_df = dbf_to_dataframe(path_to_input_file_without_db_3(scenario, 'architecture'))[['Name', 'void_deck']]
                             zone_df_4 = pd.merge(zone_df_4, void_deck_df, left_on=['name'], right_on=["Name"], how='left')
                         else:
-                            zone_df_4['void_deck'] = 0  # if void deck already does not exist in the architecture/envelope file, create a new column in the zone.shp with zeros
+                            zone_df_4['void_deck'] = 0  # no void deck recorded anywhere
 
                         zone_df_4 = zone_df_4[COLUMNS_ZONE_4]
                         replace_shapefile_dbf(scenario, 'zone', zone_df_4, COLUMNS_ZONE_3)

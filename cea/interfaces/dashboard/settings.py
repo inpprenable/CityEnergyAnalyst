@@ -1,16 +1,26 @@
 from functools import lru_cache
+import logging
 import os
-from typing import Optional
+import secrets
+from typing import Annotated, Dict, Optional
 
 from pydantic import field_validator, model_validator, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from cea.interfaces.dashboard.constants import ENV_VAR_PREFIX
 from cea.interfaces.dashboard.lib.cache.settings import cache_settings
 from cea.interfaces.dashboard.lib.database.settings import database_settings
-from cea.interfaces.dashboard.lib.logs import getCEAServerLogger
 
-logger = getCEAServerLogger("cea-server-settings")
+logger = logging.getLogger(__name__)
+
+
+class StackAuthSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix=ENV_VAR_PREFIX + "auth_",
+                                      env_file=('.env', '.env.local'), extra="ignore")
+
+    project_id: Optional[str] = None
+    publishable_client_key: Optional[str] = None
+    stack_uri: str = "https://api.stack-auth.com"
 
 
 class LimitSettings(BaseSettings):
@@ -32,17 +42,78 @@ class Settings(BaseSettings):
     project_root: Optional[str] = None
 
     local: bool = Field(default=True, description="Run in local mode. Writes to local file")
+    log_level: str = Field(default="INFO", description="Log level for the server (DEBUG, INFO, WARNING, ERROR).")
     cors_origin: str = Field(default="*", description="CORS origin(s) allowed to access the API. Use '*' for all origins (not recommended for production). For multiple origins, provide a comma-separated list (e.g. 'http://localhost:3000,https://mydomain.com')")
 
     workers: Optional[int] = Field(default=None, description="Number of workers")
 
+    jwt_secret: Optional[str] = Field(
+        default=None,
+        description=(
+            "Secret key used to sign/verify JWTs (pre-signed download links, cea-worker callback tokens)."
+        ),
+    )
+
     # Local only settings
     config_path: Optional[str] = "~/cea.config"
+
+    public_demo_scenarios: Annotated[Dict[str, str], NoDecode] = Field(
+        default_factory=dict,
+        description=(
+            "Map of demo_id -> absolute scenario path for public read-only demo access. "
+            "Env: CEA_PUBLIC_DEMO_SCENARIOS='demo1:/abs/path1,demo2:/abs/path2' (or JSON). "
+            "Empty (default) means the /demo sub-app is not mounted."
+        ),
+    )
+
+    @field_validator('log_level', mode='before')
+    @classmethod
+    def validate_log_level(cls, v):
+        import logging
+        upper = str(v).upper()
+        if upper not in logging.getLevelNamesMapping():
+            valid = ', '.join(sorted(logging.getLevelNamesMapping()))
+            raise ValueError(f"Invalid log_level '{v}'. Must be one of: {valid}")
+        return upper
 
     @field_validator('cors_origin', mode='before')
     @classmethod
     def normalise_cors_origin(cls, v):
         return v.strip() if isinstance(v, str) else v
+    
+    @field_validator('public_demo_scenarios', mode='before')
+    @classmethod
+    def parse_demo_scenarios(cls, v):
+        """Accept 'id:path,id:path' strings or JSON objects from env vars (or dicts from code)."""
+        if isinstance(v, str):
+            import json
+            v = v.strip()
+            if not v:
+                return {}
+            if v.startswith("{"):
+                try:
+                    return json.loads(v)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Invalid JSON for public_demo_scenarios: {e}") from e
+            result = {}
+            for item in v.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                if ":" not in item:
+                    raise ValueError(
+                        f"Invalid demo scenario entry '{item}'. "
+                        "Expected format: 'demo_id:/abs/path/to/scenario'."
+                    )
+                demo_id, path = (part.strip() for part in item.split(":", 1))
+                if not demo_id or not path or not os.path.isabs(path):
+                    raise ValueError(
+                        f"Invalid demo scenario entry '{item}'. "
+                        "Expected non-empty demo_id and absolute scenario path."
+                    )
+                result[demo_id] = path
+            return result
+        return v
 
     @model_validator(mode='after')
     def validate_cors_origin(self):
@@ -60,11 +131,6 @@ class Settings(BaseSettings):
                     f"Wildcard CORS origin ('*') is not allowed in non-local mode. "
                     f"Please set {(ENV_VAR_PREFIX + 'cors_origin').upper()} to your frontend URL(s)."
                 )
-            # Allow wildcard in local mode, but warn
-            logger.warning(
-                "Using wildcard CORS origin ('*'). This is only safe for local development. "
-                "For production, set CEA_CORS_ORIGIN to specific domain(s)."
-            )
             return self
 
         # Validate each origin in comma-separated list
@@ -92,6 +158,28 @@ class Settings(BaseSettings):
 
             if self.project_root is None:
                 raise ValueError(f"Project root not set. Please set {(ENV_VAR_PREFIX + 'project_root').upper()}.")
+
+            if not self.jwt_secret:
+                raise ValueError(
+                    f"JWT secret not set. Please set {(ENV_VAR_PREFIX + 'jwt_secret').upper()}."
+                )
+            if len(self.jwt_secret.encode()) < 32:
+                raise ValueError(
+                    f"JWT secret is too short. Please set {(ENV_VAR_PREFIX + 'jwt_secret').upper()} "
+                    "to a value of at least 32 bytes."
+                )
+        return self
+
+    @model_validator(mode='after')
+    def generate_local_jwt_secret(self):
+        """
+        Generate a random JWT secret for local mode if one isn't configured.
+        """
+        if self.local and not self.jwt_secret:
+            self.jwt_secret = secrets.token_urlsafe(32)
+            logger.warning(
+                "CEA_JWT_SECRET not set; generated a random secret for this local session."
+            )
         return self
 
     @model_validator(mode='after')
@@ -114,11 +202,20 @@ class Settings(BaseSettings):
         """
         Write settings to env variables in the format {ENV_VAR_PREFIX}{KEY}={VALUE}
         """
-        # Set environment variables 
+        import json
+
+        # Set environment variables
         for key, value in self.__dict__.items():
             if value is not None:
                 env_var_name = f"{ENV_VAR_PREFIX}{key.upper()}"
-                os.environ[env_var_name] = str(value)
+                # dict/list values must round-trip through parsing (e.g. worker
+                # subprocesses re-reading Settings() from env) — str() on a dict
+                # produces a Python repr with single quotes, which is not valid
+                # JSON and fails re-parsing.
+                if isinstance(value, (dict, list)):
+                    os.environ[env_var_name] = json.dumps(value)
+                else:
+                    os.environ[env_var_name] = str(value)
 
 
 @lru_cache

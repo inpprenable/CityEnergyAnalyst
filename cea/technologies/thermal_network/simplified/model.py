@@ -14,10 +14,15 @@ from cea.constants import P_WATER_KGPERM3, FT_WATER_TO_PA, FT_TO_M, M_WATER_TO_P
     KELVIN_CONVERSION
 from cea.optimization.constants import PUMP_ETA
 from cea.optimization.preprocessing.preprocessing_main import get_building_names_with_load
-from cea.technologies.thermal_network.common.geometry import extract_network_from_shapefile, load_network_shapefiles
+from cea.technologies.thermal_network.common.geometry import (
+    extract_network_from_shapefile,
+    load_network_shapefiles,
+    remove_idle_branches,
+)
 from cea.technologies.thermal_network.common.utils import add_date_to_dataframe, calculate_ground_temperature
 from cea.technologies.thermal_network.physics import calc_temperature_out_per_pipe
 from cea.technologies.network_layout.plant_node_operations import PlantServices
+from cea.scripts import tool_ref
 
 
 __author__ = "Jimeno A. Fonseca"
@@ -499,6 +504,10 @@ def thermal_network_simplified(locator: cea.inputlocator.InputLocator, config: c
     # GET INFORMATION ABOUT THE NETWORK
     network_nodes_df, network_edges_df = load_network_shapefiles(locator, network_type, network_name)
     node_df, edge_df = extract_network_from_shapefile(network_edges_df, network_nodes_df, filter_edges=True)
+    node_df, edge_df, idle_pipes = remove_idle_branches(node_df, edge_df)
+    if idle_pipes:
+        print(f"  Skipping {len(idle_pipes)} idle pipe(s) that serve no building (kept in the layout): "
+              f"{', '.join(idle_pipes[:10])}" + (" ..." if len(idle_pipes) > 10 else ""))
 
     # Determine DH service configuration from dh-temperature-mode config parameter
     itemised_dh_services = None
@@ -517,7 +526,7 @@ def thermal_network_simplified(locator: cea.inputlocator.InputLocator, config: c
                 print(f"  Warning: Plant node type '{plant_type}' contains a legacy service suffix.")
                 print("    This suffix is no longer used to control network temperature.")
                 print("    Temperature strategy is now set via thermal-network:dh-temperature-mode.")
-                print("    Re-run 'network-layout' to update plant node types to plain PLANT.")
+                print(f"    Re-run {tool_ref('network-layout')} to update plant node types to plain PLANT.")
 
         # Always use dh-temperature-mode config to determine service order
         dh_temperature_mode = config.thermal_network.dh_temperature_mode
@@ -797,7 +806,7 @@ def thermal_network_simplified(locator: cea.inputlocator.InputLocator, config: c
                     f"Recommended maximum temperature for {service_names}:\n"
                     f"  - Maximum: {max_temp_allowed}°C (allows DC to provide cooling)\n"
                     f"  - Typical VT range: 4-7°C for space cooling\n"
-                    f"  - Typical VT range: 5-10°C for data center cooling\n"
+                    f"  - Typical VT range: 5-10°C for data centre cooling\n"
                     f"\n"
                     f"Resolution:\n"
                     f"  1. Decrease network-temperature to <={max_temp_allowed}°C\n"
@@ -1025,7 +1034,7 @@ def thermal_network_simplified(locator: cea.inputlocator.InputLocator, config: c
             )
 
         # 3rd ITERATION GET FINAL UTILIZATION OF THE GRID (SUPPLY SIDE)
-        print("Starting 3rd iteration to calculate final utilization of the grid...")
+        print("Starting 3rd iteration to calculate final utilisation of the grid...")
         # get accumulated head loss per hour
         unitary_head_ftperkft = headloss_df.abs()
         unitary_head_mperm = unitary_head_ftperkft * FT_TO_M / (FT_TO_M * scaling_factor)
@@ -1049,7 +1058,7 @@ def thermal_network_simplified(locator: cea.inputlocator.InputLocator, config: c
         except Exception as e:
             error_msg = str(e)
             raise ValueError(
-                f"WNTR simulation failed during 3rd iteration (final utilization):\n{error_msg}\n\n"
+                f"WNTR simulation failed during 3rd iteration (final utilisation):\n{error_msg}\n\n"
                 f"This error occurred during final network simulation with dynamic head pattern.\n"
                 f"Base head: {base_head:.2f} m\n"
                 f"Pattern range: {min(pattern_head_m):.3f} - {max(pattern_head_m):.3f}\n\n"
@@ -1143,7 +1152,15 @@ def thermal_network_simplified(locator: cea.inputlocator.InputLocator, config: c
     temperature_of_the_ground_K = calculate_ground_temperature(locator)
     thermal_coeffcient_WperKm = pd.Series(
         np.vectorize(calc_linear_thermal_loss_coefficient)(diameter_ext_m, diameter_int_m, diameter_ins_m), pipe_names)
-    average_temperature_supply_K = T_sup_K_building.mean(axis=1)
+    # Mask idle-building sentinels before averaging: the substation writes
+    # T_supply_*_result_C = 0 for hours with no demand, which lands at 273.15 K
+    # after the Celsius->Kelvin shift and would otherwise drag the network mean
+    # toward 0 °C whenever most buildings are idle. Average over active buildings
+    # only; fall back to 0 K when all buildings are idle so the downstream
+    # validator (which filters `temperature_supply_K > 0`) treats those hours as
+    # no-flow rather than picking them as the worst-case supply.
+    T_active = T_sup_K_building.where(T_sup_K_building > KELVIN_CONVERSION + 0.1)
+    average_temperature_supply_K = T_active.mean(axis=1, skipna=True).fillna(0)
 
 
     thermal_losses_supply_kWh = link_headloss_df.copy()
@@ -1313,4 +1330,5 @@ def thermal_network_simplified(locator: cea.inputlocator.InputLocator, config: c
     # save updated edge data back to shapefile
     fields = ['length_m', 'pipe_DN', 'type_mat', 'geometry']
     edge_df_gdf = gpd.GeoDataFrame(edge_df[fields], index=edge_df.index)
+    edge_df_gdf['length_m'] = edge_df_gdf.geometry.length
     edge_df_gdf.to_file(locator.get_network_layout_edges_shapefile(network_type, network_name))

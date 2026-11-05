@@ -42,6 +42,48 @@ Loads standard CEA databases into your current scenario. These databases contain
 - Storage systems (thermal, battery)
 - Cost and performance data
 
+**Materials** (`COMPONENTS/MATERIALS/MATERIALS.csv`):
+- One row per material — brick, insulation, glazing, plaster and so on
+- Density, thermal conductivity, and the embodied-carbon factors per kilogram
+- The layer library the envelope assemblies are built from
+
+### Materials: the layer library
+
+Materials sit one level below the envelope assemblies. A wall, roof or floor assembly does not
+carry a U-value and an emission factor of its own; it names up to three material layers and
+their thicknesses, and CEA derives both from them:
+
+```
+ENVELOPE_WALL row          MATERIALS rows
+  material_name_1  ───────►  brick        conductivity, density, GHG factors
+  thickness_1_m
+  material_name_2  ───────►  insulation
+  thickness_2_m
+  material_name_3  ───────►  plaster
+  thickness_3_m
+```
+
+From those layers CEA computes the assembly's U-value, and splits its embodied carbon into the
+phases the emissions timeline needs:
+
+| from the material | becomes |
+|---|---|
+| `thermal_conductivity`, `thickness` | the assembly's U-value |
+| `GHG_emission_production` | `GHG_production_*_kgCO2m2` — EN 15978 modules A1–A3 |
+| `GHG_emission_disposal` | `GHG_demolition_*_kgCO2m2` — modules C2–C4 |
+| `biogenic_carbon_in_product` | `GHG_biogenic_*_kgCO2m2`, carried as a negative number |
+
+That is why editing a material changes results across the whole scenario: every assembly built
+from it is re-derived.
+
+**Only the Swiss (CH) database ships a materials file.** It holds 122 materials with Swiss
+(KBOB) data. The DE and SG databases have none, so scenarios built from them have no materials
+library until you supply one — the Database Editor offers to import the Swiss set, with the
+caveat that the values are specific to Switzerland.
+
+Assemblies that carry direct U-value and emission numbers instead of layers keep working; the
+material route is an alternative, not a requirement.
+
 ### How to Use
 
 1. Navigate to **Data Management**
@@ -53,7 +95,7 @@ Loads standard CEA databases into your current scenario. These databases contain
 
 The feature will copy all database files to:
 ```
-{CEA Project}/{Current Scenario}/inputs/technology/
+{CEA Project}/{Current Scenario}/inputs/database/
 ```
 
 ### Database Versions
@@ -102,8 +144,8 @@ The feature maps buildings to archetypes based on:
 
 | Parameter | Description | Typical Value |
 |-----------|-------------|---------------|
-| **Archetype system** | Regional standard (ASHRAE, SIA, etc.) | Region-specific |
-| **Overwrite existing** | Replace existing properties | Yes (first time) / No (to preserve manual edits) |
+| **Input databases** | Which building properties to map from the Database (comfort, architecture, air-conditioning, internal-loads, supply, schedules) | All |
+| **Buildings** | Buildings to map. Leave blank for all | All |
 
 ### How to Use
 
@@ -118,8 +160,8 @@ The feature maps buildings to archetypes based on:
 2. **Run Archetypes Mapper**:
    - Navigate to **Data Management**
    - Select **Archetypes Mapper**
-   - Choose archetype system (default: automatic based on location)
-   - Configure overwrite option
+   - Choose which input databases to map (default: all)
+   - Optionally restrict to selected buildings
    - Click **Run**
 
 3. **Processing time**: < 1 minute for typical projects
@@ -128,9 +170,9 @@ The feature maps buildings to archetypes based on:
 The feature populates all building property files:
 - `envelope.csv` - Envelope properties, window-wall ratios, floor heights
 - `internal_loads.csv` - Occupancy densities, appliances, lighting
-- `comfort.csv` - Setpoint temperatures, acceptable ranges
-- `air_conditioning.csv` - HVAC system types
-- `supply_systems.csv` - Energy supply configuration
+- `indoor_comfort.csv` - Setpoint temperatures, acceptable ranges
+- `hvac.csv` - HVAC system types
+- `supply.csv` - Energy supply configuration
 
 ### Understanding Archetype Mapping
 
@@ -152,15 +194,16 @@ After running Archetypes Mapper, you can manually adjust properties:
 4. Proceed with CEA analysis
 
 Common adjustments:
-- Window-wall ratios (architecture.csv)
-- HVAC system types (air_conditioning.csv)
+- Window-wall ratios (envelope.csv)
+- HVAC system types (hvac.csv)
 - Occupancy schedules (internal_loads.csv)
-- Setpoint temperatures (comfort.csv)
+- Setpoint temperatures (indoor_comfort.csv)
 
 ### Tips
 - **Run before first demand calculation**: Mandatory step
 - **Check mapped properties**: Review a few buildings to ensure reasonable values
-- **Use overwrite carefully**: Preserves manual edits if set to "No"
+- **Choose input databases deliberately**: Map only the databases you need (comfort, architecture, air-conditioning, internal-loads, supply, schedules) so other inputs are left untouched
+- **Restrict buildings if needed**: Use **Buildings** to map a subset instead of all buildings
 - **Mixed-use buildings**: Use 1ST_USE, 2ND_USE, 3RD_USE fields with percentages
 
 ### Troubleshooting
@@ -173,6 +216,149 @@ Common adjustments:
 - **Solution**: Check building year is reasonable (not 0 or future date)
 - **Solution**: Verify use type matches actual building
 - **Solution**: Manually adjust properties after mapping
+
+---
+
+## Archetype Lock
+
+Only the **zone** table is authored by you. Five of the other input-editor tabs are *derived*
+from it by the Archetypes Mapper, using each building's archetype:
+
+| you author | CEA derives from the archetype |
+|---|---|
+| zone, surroundings, trees | envelope, HVAC, indoor comfort, internal loads, supply |
+
+Building **schedules** are derived too, though they are not a tab.
+
+Editing a derived table directly makes the construction type stop describing the building it
+labels — the archetype says one thing, the tables another, and nothing records that. The
+**Archetype Lock** toggle in the input editor decides who owns those tables.
+
+### Locked
+
+CEA owns the derived tables.
+
+- The five derived tabs are **read-only** (bulk *Edit Selection*, the pen icon, too).
+- **The zone tab stays fully editable** — geometry, names, everything.
+- Change a building's **archetype** in the zone tab and CEA regenerates its derived tables when
+  you save. Add a building and it gets its derived rows the same way.
+
+The archetype is more than `const_type`. These columns all select it:
+
+```
+const_type
+use_type1, use_type1r, use_type2, use_type2r, use_type3, use_type3r
+```
+
+Changing `use_type1` matters as much as changing `const_type`: use type drives indoor comfort
+and internal loads, construction type drives envelope, HVAC and supply.
+
+`year` is **not** in that list. It labels the building's vintage but the Archetypes Mapper does
+not read it, so editing it changes nothing in the derived tables and does not trigger a
+regeneration.
+
+Editing geometry — `height_ag`, `floors_ag`, `height_vd`, the footprint — does **not** trigger a
+regeneration either, because it does not change which archetype applies.
+
+### Editing the database also regenerates
+
+The derived tables depend on two things: each building's archetype, and the archetype
+**databases** those archetypes point at. So while locked, saving a change in the Database
+Editor regenerates the derived tables too — for the buildings that reference the codes you
+changed, not the whole district.
+
+CEA works out which codes moved by comparing what you saved against what was on disk, across
+every source the Archetypes Mapper reads:
+
+| you changed | it re-derives |
+|---|---|
+| a `const_type` in `CONSTRUCTION_TYPE.csv` | envelope, HVAC, supply |
+| a `use_type` in `USE_TYPE.csv` | indoor comfort, internal loads, schedules |
+| a monthly multiplier or a schedule in the library | the same use-type set |
+
+**Deleting** a code counts as a change too — a building still pointing at one you removed
+cannot be quietly left alone.
+
+Without this, editing a construction type would leave every building using it with stale
+envelope, HVAC and supply values, and nothing would say so.
+
+### Unlocked
+
+You own the derived tables and may edit them freely. Nothing on disk changes when you unlock.
+
+Once a value no longer matches what the archetype would produce, CEA marks it — per building
+and per tab, not as a blanket warning on the scenario. What gets marked depends on how the tab
+is derived:
+
+| tab | how it is checked | what you see |
+|---|---|---|
+| envelope, HVAC, supply | a direct lookup on `const_type`, compared live against the construction-type database | the **cell** is marked |
+| indoor comfort, internal loads | computed from the `use_type` mix, compared against the values recorded at the last lock | the **row** is marked |
+| zone | rolled up from the above | the archetype columns are marked |
+
+Envelope, HVAC and supply are a pure lookup, so CEA can point at the exact cell that disagrees.
+Indoor comfort and internal loads are weighted averages across the use-type mix, so a change
+cannot be pinned to one cell — the row is marked instead.
+
+Every mark carries a tooltip saying why, and a stripe as well as a tint, so the meaning does not
+depend on seeing colour.
+
+### Re-locking
+
+Re-locking regenerates envelope, HVAC, indoor comfort, internal loads, supply **and the
+building schedules** for every building, from their archetypes. **Any edits you made to those
+tables are lost.** The confirmation names the tabs and the number of buildings affected.
+
+### Defaults
+
+| scenario | default |
+|---|---|
+| created by CEA | **locked** — it has just been mapped, so it is consistent |
+| existing, from before this feature | **unlocked** |
+
+Existing scenarios default to unlocked deliberately: they may already contain hand-edits, and
+treating them as locked would licence CEA to overwrite work it knows nothing about. Lock one
+when you are ready for CEA to regenerate its derived tables.
+
+### The lock is enforced when you save, not just in the editor
+
+Read-only tabs are the visible half. CEA also refuses to write the derived tables while locked,
+whatever is sent to it — so a browser tab left open from before the lock cannot overwrite them.
+
+---
+
+## Duplicating a building
+
+Select a single building on the **zone** tab and press the duplicate icon in the table toolbar.
+A dialog proposes a name — the original's with an underscore, `B1000_` — which you can change
+before confirming. The copy appears in the table straight away; nothing is written until you
+save.
+
+**The button is only available while Archetype Lock is on.** A new building has no envelope,
+HVAC, comfort, loads or supply rows of its own: CEA generates them on save, from the copy's
+archetype, and that only happens while locked. Unlocked, you would be left with a building that
+every downstream script reads as missing data.
+
+### What is copied, and what is not
+
+| | |
+|---|---|
+| copied | the zone row — archetype, geometry, every attribute |
+| generated on save | envelope, HVAC, indoor comfort, internal loads, supply, and the schedule file |
+
+The derived tables are **re-derived from the archetype, not cloned**. If you had hand-edited the
+original's envelope while unlocked, the copy gets the archetype's values, not your edits. That
+follows from CEA owning those tables while locked, but it does surprise people.
+
+### The copy sits on the original's footprint
+
+The duplicate keeps the original's geometry exactly, so the two buildings overlap. That is fine
+for setting up attributes, but overlapping footprints distort solar radiation and demand — move
+or redraw one before simulating.
+
+Names must be unique, and because a building name becomes a file name
+(`inputs/building-properties/schedules/{name}.csv`) the dialog rejects path separators and the
+characters `< > : " ' | ? *`.
 
 ---
 
@@ -199,7 +385,7 @@ Fetches EPW (EnergyPlus Weather) files from third-party sources or morphs existi
 - Uses `pyepwmorph` library
 - Access global climate models (GCMs)
 - Generate future climate scenarios (2030, 2050, 2080, etc.)
-- Multiple RCP/SSP scenarios (climate forcing scenarios)
+- Four SSP-based climate pathways (Best Case, Moderate, Upper Middle, Worst Case)
 
 ### Prerequisites
 - Zone geometry (for location detection)
@@ -209,10 +395,11 @@ Fetches EPW (EnergyPlus Weather) files from third-party sources or morphs existi
 
 | Parameter | Description | Typical Value |
 |-----------|-------------|---------------|
-| **Mode** | Fetch or Morph | Fetch |
-| **Target year** (morph) | Future year | 2050 |
-| **Climate scenario** (morph) | RCP/SSP | RCP 4.5 or RCP 8.5 |
-| **GCM model** (morph) | Climate model | Ensemble mean |
+| **Weather** | Fetch an EPW from climate.onebuilding.org, morph the existing EPW, or import one from a path | climate.onebuilding.org |
+| **Year** (morph) | Year to morph the weather file to | 2060 |
+| **Climate pathway** (morph) | Best Case (SSP126), Moderate (SSP245), Upper Middle (SSP370), Worst Case (SSP585) | Moderate |
+| **Percentile** (morph) | Percentile applied to temperature and radiation | 50 |
+| **Variables** (morph) | Weather variables to morph (Temperature, Clouds and Radiation, Humidity, Wind, Pressure, Dew Point) | Temperature |
 
 ### How to Use
 
@@ -232,14 +419,16 @@ Fetches EPW (EnergyPlus Weather) files from third-party sources or morphs existi
 
 1. **Ensure current EPW file exists** in scenario
 2. Navigate to **Weather Helper**
-3. Choose mode: **Morph to future climate**
-4. Set target year (e.g., 2050)
-5. Select climate scenario:
-   - **RCP 2.6**: Strong mitigation (low warming)
-   - **RCP 4.5**: Moderate mitigation (medium warming)
-   - **RCP 8.5**: High emissions (high warming)
-6. Click **Run**
-7. Morphed EPW file saved as `{scenario}/inputs/weather/weather_morphed_YEAR_SCENARIO.epw`
+3. Set **Weather** to `pyepwmorph`
+4. Set **Year** (e.g., 2050)
+5. Select **Climate pathway**:
+   - **Best Case**: +1.8°C (SSP126)
+   - **Moderate**: +2.7°C (SSP245)
+   - **Upper Middle**: +3.6°C (SSP370)
+   - **Worst Case**: +4.4°C (SSP585)
+6. Optionally set **Percentile** and **Variables** to morph
+7. Click **Run**
+8. The morphed file replaces `{scenario}/inputs/weather/weather.epw`; the original is kept once as `before_morph_weather.epw` in the same folder
 
 ### Understanding Weather Files
 
@@ -278,7 +467,7 @@ Reference: [McCarty & Shareef (2023)](https://doi.org/10.1088/1742-6596/2600/8/0
 - **Solution**: Check internet connection (pyepwmorph may need to download climate data)
 
 **Issue**: Unrealistic future temperatures
-- **Solution**: Verify climate scenario and target year are correctly selected
+- **Solution**: Verify climate pathway, year, and percentile are correctly selected
 - **Solution**: Check base EPW file is reasonable
 
 ---
@@ -295,7 +484,7 @@ Automatically queries and downloads surrounding building geometries from OpenStr
 
 ### How It Works
 1. Detects location from zone geometry
-2. Queries OpenStreetMap for buildings within radius
+2. Queries OpenStreetMap for buildings within the **Buffer** distance around the zone
 3. Estimates building heights (from OSM data or rules of thumb)
 4. Creates `surroundings.shp` shapefile
 
@@ -307,14 +496,13 @@ Automatically queries and downloads surrounding building geometries from OpenStr
 
 | Parameter | Description | Typical Value |
 |-----------|-------------|-------------|
-| **Search radius** | Distance to fetch buildings (m) | 50-100 m |
-| **Height estimation** | Method for missing heights | OSM data or # of floors × 3m |
+| **Buffer** | Distance around the zone to fetch surrounding buildings (m) | 50 |
 
 ### How to Use
 
 1. Navigate to **Data Management**
 2. Select **Surroundings Helper**
-3. Set search radius:
+3. Set buffer:
    - **Urban core**: 50-100 m (many nearby tall buildings)
    - **Suburban**: 30-50 m (fewer, lower buildings)
    - **Rural**: 20-30 m (sparse buildings)
@@ -337,7 +525,7 @@ Automatically queries and downloads surrounding building geometries from OpenStr
 - Influences cooling loads (solar gains through windows)
 
 ### Tips
-- **Larger radius for tall buildings**: Tall buildings cast longer shadows
+- **Larger buffer for tall buildings**: Tall buildings cast longer shadows
 - **Check heights**: OSM height data is often incomplete; verify for key buildings
 - **Manual editing**: You can manually edit `surroundings.shp` to correct heights
 - **Exclude distant buildings**: Buildings >1 km usually negligible for shading
@@ -353,7 +541,7 @@ Automatically queries and downloads surrounding building geometries from OpenStr
 - **Solution**: Manually edit surroundings.shp to add heights
 
 **Issue**: Too many surrounding buildings (slow radiation calculation)
-- **Solution**: Reduce search radius
+- **Solution**: Reduce the buffer
 - **Solution**: Manually filter distant or irrelevant buildings
 
 ---
@@ -391,7 +579,7 @@ Fetches topography data (.tif elevation raster) from third-party sources. Terrai
 
 **Terrain raster**: `terrain.tif`
 - GeoTIFF format
-- Elevation values in meters
+- Elevation values in metres
 - Covers zone + surroundings extent
 - Typical resolution: 30m × 30m (SRTM) or better
 
@@ -453,21 +641,20 @@ Queries streets geometry from OpenStreetMap for use in thermal network layout ge
 
 | Parameter | Description | Typical Value |
 |-----------|-------------|---------------|
-| **Road types** | Which roads to include | Primary, secondary, residential |
-| **Search radius** | Distance to fetch streets | Match zone extent + buffer |
+| **Include private streets** | Include streets OpenStreetMap tags as private (tagging is not always accurate) | true |
 
 ### How to Use
 
 1. Navigate to **Data Management**
 2. Select **Streets Helper**
-3. Configure road types (default: all paved roads)
+3. Choose whether to include private streets (default: included)
 4. Click **Run**
 5. Streets saved to `{scenario}/inputs/networks/streets.shp`
 
 ### Output File
 
 **Streets shapefile**: `streets.shp`
-- Polylines representing street centerlines
+- Polylines representing street centrelines
 - Street names and types
 - Network topology (connections)
 
@@ -547,7 +734,7 @@ Required attributes:
    - Provide tree data file
    - Click **Run**
 
-4. Trees saved to `{scenario}/inputs/building-geometry/trees.shp`
+4. Trees saved to `{scenario}/inputs/tree-geometry/trees.shp`
 
 ### Tree Shading Effects
 
@@ -568,13 +755,219 @@ Required attributes:
 ### Tips
 - **Worth the effort for tree-heavy sites**: Skip if minimal tree coverage
 - **Estimate if needed**: Use aerial imagery and typical dimensions
-- **Seasonal variation**: Deciduous trees modeled with seasonal LAI
+- **Seasonal variation**: Deciduous trees modelled with seasonal LAI
 
 ### Troubleshooting
 
 **Issue**: Trees not affecting solar radiation results
 - **Solution**: Verify trees.shp is in correct location and format
 - **Solution**: Check tree heights are reasonable (>2m typically)
+
+---
+
+## Void Decks
+
+A **void deck** is the open, unenclosed portion at the bottom of a building — the open ground
+floors common in Singapore HDB blocks, or a building on stilts. It has no facade, contributes
+no floor area, and leaves the underside exposed to outside air.
+
+Record it in the zone geometry, in **metres**:
+
+| Column | Meaning |
+|---|---|
+| `height_vd` | Height of the void deck above ground, in metres. Optional; `0` or absent means none. |
+| `void_deck` | **Legacy.** The same void expressed as a whole number of floors. |
+
+### How `floors_ag` is counted
+
+This is the part to get right, because the two columns differ:
+
+| | `height_ag` | `floors_ag` |
+|---|---|---|
+| with `height_vd` | void deck **+** enclosed building | **enclosed storeys only** |
+| with `void_deck` (legacy) | void deck **+** enclosed building | **every storey**, void ones included |
+
+So the same building can be written either way:
+
+```
+A 15 m block: 6 m open void deck, then 3 enclosed floors of 3 m
+
+  legacy   void_deck = 2   floors_ag = 5   height_ag = 15
+  metres   height_vd = 6   floors_ag = 3   height_ag = 15
+```
+
+Both give the same floor area, the same storey height, and the same 3D solid.
+
+The storey height of the enclosed part is always
+
+```
+(height_ag − void deck height) ÷ enclosed floors
+```
+
+which is `(15 − 6) ÷ 3 = 3 m` either way. Note the denominator is the **enclosed** floor
+count — that is `floors_ag` itself with `height_vd`, but `floors_ag − void_deck` with the
+legacy column.
+
+### Why metres matter: a void deck taller than a storey
+
+A real void deck is often taller than the floors above it, and whole floors cannot express
+that. An HDB-style block with a 4.5 m void deck under four 2.8 m residential floors:
+
+```
+  height_vd = 4.5    floors_ag = 4    height_ag = 15.7
+  -> storey height (15.7 − 4.5) / 4 = 2.8 m, and 4 whole floors of area
+```
+
+Forcing that onto a single uniform storey grid would give a 3.14 m storey — neither the real
+void deck nor the real floor — and understate the floor area by about 11%.
+
+### Metres, not floors
+
+`void_deck` could only express whole storeys, so a 4.5 m void in a building with 3 m floors had
+to be rounded. `height_vd` records the height directly, so the void can sit anywhere.
+
+**A new scenario gets `height_vd`, set to 0**, so the column is there to edit without adding a
+field in GIS. `0` means the building is enclosed to the ground.
+
+There is one exception, and it is deliberate. If you **upload** a `zone.shp` that already
+carries `void_deck`, CEA keeps your column as it is and does **not** add `height_vd` beside it —
+converting would rewrite your data, and two columns for one concept is worse than one. Generate
+the zone from OpenStreetMap, or upload one carrying neither column, and you get `height_vd = 0`.
+
+| how the zone arrives | what you end up with |
+|---|---|
+| generated from OpenStreetMap | `height_vd = 0` |
+| uploaded, carrying neither column | `height_vd = 0` |
+| uploaded, already carrying `void_deck` | your `void_deck`, untouched — no `height_vd` |
+
+**Existing scenarios keep working and are not modified.** Where `height_vd` is absent, CEA reads
+`void_deck` and converts it at that building's own storey height (`height_ag / floors_ag`) —
+the same conversion it always applied internally, so results do not change. Neither column is
+required; a scenario with neither simply has no void decks.
+
+Where both columns are present, CEA decides **per building, on the value**: a building whose
+`height_vd` cell has a number uses it (and CEA warns that its `void_deck` is being ignored),
+while a **blank** cell falls back to `void_deck`.
+
+That matters when you open an older scenario in the input editor: the editor shows every column
+in the schema, so you will see an empty `height_vd` column beside your populated `void_deck`.
+**This is expected and harmless** — leaving it empty changes nothing. Entering a value switches
+that building to metres; entering `0` removes its void deck.
+
+You never have to migrate a CEA-4 scenario by hand. Add or edit `height_vd` only when you want a
+void that is not a whole number of storeys.
+
+### Upgrading from CEA-3
+
+CEA-3 stored the void deck in `architecture.dbf`, in whole floors. The CEA-4 migration moves it
+into the zone geometry **as `void_deck`, unchanged** — it is not converted to metres.
+
+That is deliberate. Converting would mean redefining `floors_ag` to the enclosed count, and
+`floors_ag` is read elsewhere as the total above-ground storey count (the database migration
+rescales the occupied-area share `Ns` by `(floors_ag + floors_bg) / floors_ag`). Rewriting it
+would quietly change occupied areas and demand for every migrated building. A migrated scenario
+therefore keeps exactly the areas it had.
+
+To move a building to metres yourself, convert both columns together: set
+`height_vd = void_deck × (height_ag / floors_ag)`, reduce `floors_ag` by `void_deck`, and remove
+`void_deck`. For the example above: `void_deck = 2, floors_ag = 5` becomes
+`height_vd = 6, floors_ag = 3`.
+
+### What it affects
+
+- **Floor area** — the void contributes no GFA, so conditioned and occupied areas shrink with it
+- **Embodied emissions** — void storeys have no partitions, no floor slab and no technical
+  systems, so they are excluded from the embodied floor area as well
+- **Facade area** — no walls or windows over the void height, which lowers embodied emissions
+- **Heat loss** — the underside is exposed to outside air rather than sitting on the ground
+- **Radiation** — the building solid starts at the top of the void deck
+- **Radiation engine** — CRAX does not support void decks, so CEA falls back to DAYSIM when any
+  building has one (see [Solar Radiation](02-solar-radiation.md))
+
+### Rules
+
+- Always measured **from ground level up**. CEA does not model an open storey part-way up a
+  building.
+- Must leave at least **2 m of height per enclosed floor**. CEA measures this on the enclosed
+  part, not on `height_ag`, so a tall void deck cannot hide storeys squeezed into what is left.
+- Cannot be negative.
+
+---
+
+## Database Editor: Material Layers
+
+The Database Editor can now edit **material layers** for envelope assemblies, and derive the
+thermal and carbon properties from them rather than requiring you to enter those numbers by
+hand.
+
+### The materials database
+
+Materials live in `COMPONENTS/MATERIALS/MATERIALS.csv` and are referenced by name from the
+envelope assemblies.
+
+Only the **Swiss (CH)** database ships with a materials file. Open **COMPONENTS → MATERIALS**
+in a scenario built from another region and the editor explains this and offers to import the
+Swiss set, which is based on KBOB data.
+
+> **Use at your own risk.** The imported values are specific to Switzerland and may not
+> represent materials available in your region.
+
+### Building up an envelope from layers
+
+On the **ENVELOPE** tabs each assembly row carries up to three layers:
+
+| Column | Meaning |
+|---|---|
+| `material_name_1` … `material_name_3` | Material, chosen from a dropdown of the materials database |
+| `thickness_1_m` … `thickness_3_m` | Layer thickness in metres |
+
+The material dropdowns only list names that exist in your materials file, so a row cannot
+reference a material that is not there. These six columns appear only when a materials file
+is present.
+
+### Derived columns
+
+Once a row has at least one material with a thickness greater than zero, CEA derives its
+properties from the layers and **locks** the derived cells — they are computed, so editing
+them by hand would be silently overwritten:
+
+| Derived | Example column |
+|---|---|
+| U-value | `U_base` |
+| Total embodied carbon | `GHG_floor_kgCO2m2` |
+| Biogenic carbon | `GHG_biogenic_floor_kgCO2m2` |
+| Production carbon (A1-A3) | `GHG_production_floor_kgCO2m2` |
+| Disposal carbon (C2-C4) | `GHG_demolition_floor_kgCO2m2` |
+
+Splitting embodied carbon into **production** and **demolition** is what lets the
+[LCA Part 2a: GHG Emissions](06-2-emissions.md) feature report those EN 15978 modules separately.
+
+### What you must still provide
+
+Layers are optional — a database with no materials file keeps working exactly as before, with
+U-values and carbon entered directly.
+
+| Situation | Required |
+|---|---|
+| Row has at least one material with thickness > 0 | U-value and GHG columns may be left empty; they are derived |
+| Row has no usable material layer | U-value and GHG columns must be filled in |
+| Every row | Service life must be greater than zero |
+
+Values are validated when you save, and errors name the row and column at fault. A genuine
+zero is accepted — CEA distinguishes "zero" from "not filled in".
+
+### Cross-check
+
+Where a row has both derived values and values already in the file, CEA compares them and
+warns if they differ by more than **1%**. Small differences are expected: published totals are
+rounded, so production plus disposal rarely reproduces the stated total exactly.
+
+### Tips
+
+- Biogenic carbon is stored as a **negative** number throughout, representing carbon held in
+  the material. Do not enter it as positive.
+- After changing materials, re-run any analysis that reads envelope properties — the derived
+  values change with them.
 
 ---
 

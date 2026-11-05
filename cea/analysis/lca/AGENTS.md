@@ -17,6 +17,64 @@
 | `embodied.py` | `lca_embodied(year, locator)` — legacy embodied LCA (60-year payoff method) |
 | `operation.py` | `lca_operation(locator)` — legacy operational LCA from demand results |
 
+## Life-Cycle Module Coverage (EN 15978)
+
+See `docs/developer/lca-standard-coverage.md` for the full EN 15978 phase-coverage table
+(what's modelled, estimated, or not covered) and why the `demolition` phase is C2-C4, not C1.
+
+### Maintenance (B2) and repair (B3) are estimated, not modelled
+
+Both are proportions of the production term rather than simulated activities, because CEA has
+no maintenance schedules or spare-part inventories. RICS (2017) sanctions this, and Green Mark
+Version 7's Cn Technical Guide adopts it (Table 16, GWP Base Formulae):
+
+| module | RICS basis | CEA default |
+|---|---|---|
+| B2 maintenance | 1% of A1-A5 | `emissions:maintenance-fraction-of-production` = 0.01 |
+| B3 repair | 10% of A1-A3 | `emissions:repair-fraction-of-production` = 0.10 |
+
+Two deliberate deviations, both conservative:
+
+- **RICS states B2 against A1-A5**, and CEA models A1-A3 only (no A4 transport, no A5
+  construction). The 1% is therefore applied to a smaller base, so B2 is under-stated.
+- **Neither RICS formula carries a frequency term**, unlike B4 replacement (`A1-A4 x
+  frequency`). CEA charges the allowance once per *installed generation* -- on the component's
+  own replacement cycle -- rather than annually, reading it as a per-installation allowance.
+  An annual reading would give a figure tens of times larger.
+
+Set either fraction to 0 to exclude that module. The defaults are also available as
+`DEFAULT_MAINTENANCE_FRACTION` / `DEFAULT_REPAIR_FRACTION` for callers without a
+Configuration.
+
+### Technical systems (MEP) are counted, but not per device
+
+**Replacement is per component; intensity is still blanket.**
+`_log_technical_system_emissions` resolves each supply service's `primary_component_{hs,cs,dhw}`
+(exposed by `BuildingSupplySystems`) to that component's own `LT_yr` via
+`component_lca.service_life_for_component`, and logs one replacement cycle per component. A
+20-year boiler and a 25-year chiller therefore renew independently. `log` is additive, so all
+of them accumulate into the single reported `technical_systems` column -- the output shape is
+unchanged.
+
+The **embodied intensity** is still `EMISSIONS_EMBODIED_TECHNICAL_SYSTEMS` (35 kgCO2e/m2 GFA),
+shared equally between the services present, so the building total is unchanged from the
+previous blanket treatment. Per-component carbon awaits capacities:
+`component_lca.embodied_factor_for_component` reads the optional capacity-based
+`GHG_embodied_kgCO2e_per_unit` (in the component's own `unit` -- W, VA, m2, m3, kWh, like the
+cost curve), but installed capacities are not available in the timeline, and no family except
+`PHOTOVOLTAIC_PANELS` carries data yet.
+
+Two deliberate exclusions:
+
+- **Electricity** has no component. `SUPPLY_ELECTRICITY` describes a grid connection, so
+  `_SUPPLY_SERVICES` covers heating, cooling and hot water only.
+- **A building with no components at all** (every service `NONE`, or a district connection
+  whose plant is accounted for separately) keeps the old blanket cycle rather than dropping
+  to zero.
+
+An assumed service life is named in the timeline note, since it changes the replacement
+count.
+
 ## Two Paths: What-If vs Legacy
 
 ### What-If Path (current, recommended)
@@ -82,8 +140,13 @@ Buildings using DH/DC have **zero** operational emissions for those services at 
 
 Indexed by `period` (`Y_XXXX`), columns:
 
-**Embodied** (3 types × 10 components = 30 columns):
-- `{emission}_{component}_kgCO2e` where emission ∈ {`production`, `biogenic`, `demolition`}
+**Embodied** (5 types × 10 components = 50 columns):
+- `{emission}_{component}_kgCO2e` where emission ∈ {`production`, `biogenic`, `demolition`,
+  `maintenance`, `repair`}
+  - `biogenic` values are negative (stored carbon): the database column is already negative,
+    so it is logged as-is. Do not negate it -- see `cea/databases/AGENTS.md`.
+  - `maintenance` and `repair` are fractions of `production`, not independent quantities --
+    see Maintenance (B2) and repair (B3) above.
 - Components: `wall_ag`, `wall_bg`, `wall_part`, `win_ag`, `roof`, `upperside`, `underside`, `floor`, `base`, `technical_systems`
 
 **Operational** (6 columns):
@@ -214,6 +277,33 @@ hourly.operational_emission_timeline_extended                 # pd.DataFrame wit
 - Reads external CSV with 8760 (or 8784 → drops Feb 29) hourly grid carbon intensity values (g CO2/kWh)
 - Configured via `config.emissions.grid_carbon_intensity_dataset_csv` + `csv_carbon_intensity_column_name`
 - Overrides the GRID column in feedstock emission intensity
+- The column name has no way to be validated until the CSV is actually read here (the file may
+  still be an unsubmitted browser upload when the user is typing it), so
+  `_resolve_grid_intensity_column` resolves it leniently against the file's real header
+  (exact match, then Unicode/whitespace-tolerant match) and raises a `ValueError` naming the
+  available columns -- plus close-match suggestions -- rather than a raw pandas `usecols` error.
+  Errors report the file's basename only; the on-disk path is a server-side temp file.
+- `_resolve_grid_intensity_column` also sniffs the file's delimiter (`_sniff_csv_delimiter`)
+  instead of assuming pandas' default comma, returning it alongside the resolved column name so
+  the caller reuses the same separator for the actual data read. Without this, a semicolon/tab-
+  delimited file (e.g. a European-locale spreadsheet export) doesn't raise a parse error --
+  with no comma to split on, the whole header line silently becomes one garbled column name, so
+  the user sees a single nonsensical "column not found" option instead of a clear signal that
+  the delimiter is wrong.
+- A file that isn't UTF-8 raises `UnicodeDecodeError`, which is a `ValueError` and *not* an
+  `OSError`/`ParserError`: both reads catch it separately and raise `_NOT_UTF8_MESSAGE`.
+- `csv-carbon-intensity-column-name`'s config type is `CsvColumnNameParameter`
+  (`SourceParameterMixin`, `cea/config.py`), whose `.source-parameter` metadata names the
+  sibling `grid-carbon-intensity-dataset-csv` field. This is pure GUI metadata: it doesn't
+  affect `decode()`/`encode()`, and the backend resolution above is still the actual
+  validation -- it exists so a GUI can read `source_parameter` off the metadata payload and
+  know which upload field this column name belongs to.
+  A companion change in the separate `CityEnergyAnalyst-GUI` repo (`CsvColumnSelect` in
+  `src/components/Parameter.jsx`) consumes this: it watches the paired file field's selected
+  `File` and reads its header row client-side (`utils/csv.js`) to offer a dropdown of the real
+  column names instead of free text -- no server round-trip, since the file isn't uploaded
+  until job submission. Whether that dropdown is live depends on that repo's own release, not
+  on this one.
 
 ## Feedstock Decarbonisation Policies
 

@@ -1,4 +1,5 @@
 import hashlib
+import os
 from typing import Dict, Any
 
 from fastapi import APIRouter
@@ -6,7 +7,12 @@ from fastapi.concurrency import run_in_threadpool
 
 import cea.config
 import cea.plots
-from .utils import deconstruct_parameters, validate_scenario_name
+from .utils import (
+    CEAScenarioLenient,
+    deconstruct_parameters,
+    split_scenario_subpath,
+    validate_scenario_name,
+)
 from cea.interfaces.dashboard.dependencies import CEAConfig, CEAPlotCache
 
 router = APIRouter()
@@ -57,8 +63,13 @@ def get_parameters_from_plot(config, plot, scenario_name=None):
 
 def get_parameters_from_plot_class(config, plot_class, scenario_name=None):
     parameters = []
-    # Make sure to set scenario name to config first
+    # `scenario_name` may be a project-relative sub-path (canvas
+    # pathway-single columns); `split_scenario_subpath` rebases the
+    # project so `config.scenario_name` stays a bare basename.
     if 'scenario-name' in plot_class.expected_parameters and scenario_name is not None:
+        config.project, scenario_name = split_scenario_subpath(
+            scenario_name, config.project,
+        )
         config.scenario_name = scenario_name
 
     for pname, fqname in sorted(plot_class.expected_parameters.items(), key=lambda x: x[1]):
@@ -105,11 +116,16 @@ async def get_plot_categories(config: CEAConfig):
 
 
 @router.get('/plot-categories/{category_name}/plots/{plot_id}/parameters')
-async def get_plot_category_parameters(config: CEAConfig, category_name: str, plot_id: str, scenario: str = None):
-    if scenario is not None:
-        scenario = validate_scenario_name(scenario)
+async def get_plot_category_parameters(
+    config: CEAConfig,
+    scenario: CEAScenarioLenient,
+    category_name: str,
+    plot_id: str,
+):
+    config.project = os.path.dirname(scenario)
+    config.scenario_name = os.path.basename(scenario)
     plot_class = cea.plots.categories.load_plot_by_id(category_name, plot_id, config.plugins)
-    return get_parameters_from_plot_class(config, plot_class, scenario)
+    return get_parameters_from_plot_class(config, plot_class, config.scenario_name)
 
 
 @router.post('/duplicate')
@@ -218,19 +234,24 @@ async def delete_plot(config: CEAConfig, plot_cache: CEAPlotCache,  dashboard_in
 
 
 @router.get('/{dashboard_index}/plots/{plot_index}/parameters')
-async def get_plot_parameters(config: CEAConfig, plot_cache: CEAPlotCache,
-                              dashboard_index: int, plot_index: int, scenario: str = None):
+async def get_plot_parameters(
+    config: CEAConfig,
+    plot_cache: CEAPlotCache,
+    scenario: CEAScenarioLenient,
+    dashboard_index: int,
+    plot_index: int,
+):
     """
     Get Plot Form Parameters of Plot in Dashboard
     """
-    if scenario is not None:
-        scenario = validate_scenario_name(scenario)
+    config.project = os.path.dirname(scenario)
+    config.scenario_name = os.path.basename(scenario)
     dashboards = await run_in_threadpool(lambda: cea.plots.read_dashboards(config, plot_cache))
 
     dashboard = dashboards[dashboard_index]
     plot = dashboard.plots[plot_index]
 
-    return get_parameters_from_plot(config, plot, scenario)
+    return get_parameters_from_plot(config, plot, config.scenario_name)
 
 
 @router.get('/{dashboard_index}/plots/{plot_index}/input-files')

@@ -1,14 +1,14 @@
+import hashlib
 import io
 import json
 import os
 import shutil
-import sys
 import tempfile
 import traceback
 import warnings
 from collections import defaultdict
 from contextlib import redirect_stdout
-from typing import Dict, Any
+from typing import Dict, Any, Literal
 import zipfile
 
 from fastapi.responses import StreamingResponse
@@ -20,22 +20,45 @@ from fiona.errors import DriverError
 from pydantic import BaseModel, Field
 
 import cea.config
+import cea.databases
 import cea.inputlocator
+from cea.datamanagement import archetype_lock
+from cea.datamanagement.archetypes_mapper import archetypes_mapper
+from cea.datamanagement.district_pathways.pathway_timeline import PathwayChildScenario
+from cea.datamanagement.databases_verification import (
+    COLUMNS_ZONE_GEOMETRY,
+    OPTIONAL_COLUMNS_ZONE_GEOMETRY,
+    verify_zone_attributes,
+)
+from cea.datamanagement.utils import VOID_FLOORS_COLUMN
 from cea.interfaces.dashboard.lib.logs import getCEAServerLogger
 import cea.schemas
-from cea.databases import CEADatabase, CEADatabaseException
+from cea.databases import CEADatabase, CEADatabaseException, databases_folder_path
+from cea.datamanagement.database.archetypes import Archetypes
+from cea.datamanagement.database.assemblies import CROSS_CHECK_REL_TOLERANCE
+from cea.utilities import validate_path_within_root
 from cea.datamanagement.format_helper.cea4_verify_db import cea4_verify_db
-from cea.interfaces.dashboard.dependencies import CEAProjectInfo, CEASeverDemoAuthCheck
-from cea.interfaces.dashboard.utils import secure_path
+
+from cea.interfaces.dashboard.utils import (
+    secure_path,
+    secure_join_under_root,
+    OutsideProjectRootError,
+)
+from cea.interfaces.dashboard.api.utils import CEAScenario
 from cea.plots.supply_system.a_supply_system_map import get_building_connectivity, newer_network_layout_exists
 from cea.plots.variable_naming import get_color_array
 from cea.technologies.network_layout.main import auto_layout_network, NetworkLayout
+from cea.utilities.file_lock import FileLock
 from cea.utilities.schedule_reader import schedule_to_file, read_cea_schedule, save_cea_schedules
-from cea.utilities.standardize_coordinates import get_geographic_coordinate_system
+from cea.utilities.standardize_coordinates import (
+    get_geographic_coordinate_system,
+    validate_geometries_before_crs_transform,
+)
 
 router = APIRouter()
 
 logger = getCEAServerLogger("cea-server-inputs")
+
 
 COLORS = {
     'surroundings': get_color_array('grey_light'),
@@ -69,6 +92,12 @@ def get_input_database_schemas():
     return input_database_schemas
 
 
+# Schema column keys sent to the input editor as-is. The editor builds its cell validators from
+# these, so a validation rule added to schemas.yml reaches it only if its key is listed here
+# (`test_every_schema_column_key_is_classified` fails until it is). `choice` is sent
+# transformed, as `path` + `choices`; `type`, `description` and `unit` are always sent.
+FORWARDED_COLUMN_KEYS = ('constraints', 'regex', 'example', 'nullable', 'min', 'max', 'exclusive_min')
+
 INPUTS = get_input_database_schemas()
 INPUT_KEYS = INPUTS.keys()
 GEOJSON_KEYS = ['zone', 'surroundings', 'trees', 'streets', 'dc', 'dh']
@@ -77,7 +106,7 @@ NETWORK_KEYS = ['dc', 'dh']
 
 @router.get("/")
 async def get_keys():
-    return {'buildingProperties': INPUT_KEYS, 'geoJSONs': GEOJSON_KEYS}
+    return {'buildingProperties': list(INPUT_KEYS), 'geoJSONs': GEOJSON_KEYS}
 
 
 @router.get('/building-properties/{db}')
@@ -95,8 +124,8 @@ async def get_building_props_db(db: str):
 
 
 @router.get('/geojson/{kind}')
-async def get_input_geojson(project_info: CEAProjectInfo, kind: str):
-    locator = cea.inputlocator.InputLocator(project_info.scenario)
+async def get_input_geojson(scenario: CEAScenario, kind: str):
+    locator = cea.inputlocator.InputLocator(scenario)
 
     if kind not in GEOJSON_KEYS:
         raise HTTPException(
@@ -106,40 +135,39 @@ async def get_input_geojson(project_info: CEAProjectInfo, kind: str):
     # Building geojsons
     elif kind in INPUT_KEYS and kind in GEOJSON_KEYS:
         db_info = INPUTS[kind]
-        locator = cea.inputlocator.InputLocator(project_info.scenario)
         location = getattr(locator, db_info['location'])()
         if db_info['file_type'] != 'shp':
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f'Invalid database for geojson: {location}',
             )
-        return df_to_json(location)[0]
+        return df_to_json(location, root=scenario)[0]
     elif kind in NETWORK_KEYS:
-        return get_network(project_info.scenario, kind)[0]
+        return get_network(scenario, kind)[0]
     elif kind == 'streets':
-        return df_to_json(locator.get_street_network())[0]
+        return df_to_json(locator.get_street_network(), root=scenario)[0]
 
 
 @router.get('/building-properties')
-async def get_building_props(project_info: CEAProjectInfo):
-    return get_building_properties(project_info.scenario)
+async def get_building_props(scenario: CEAScenario):
+    return get_building_properties(scenario)
 
 
 @router.get('/all-inputs')
-async def get_all_inputs(project_info: CEAProjectInfo):
-    locator = cea.inputlocator.InputLocator(project_info.scenario)
+async def get_all_inputs(scenario: CEAScenario):
+    locator = cea.inputlocator.InputLocator(scenario)
 
     # FIXME: Find a better way, current used to test for Input Editor
     def fn():
-        store = get_building_properties(project_info.scenario)
+        store = get_building_properties(scenario)
         store['geojsons'] = {}
         store['connected_buildings'] = {'dc': [], 'dh': []}
         store['crs'] = {}
-        store['geojsons']['zone'], store['crs']['zone'] = df_to_json(locator.get_zone_geometry())
+        store['geojsons']['zone'], store['crs']['zone'] = df_to_json(locator.get_zone_geometry(), root=scenario)
         store['geojsons']['surroundings'], store['crs']['surroundings'] = df_to_json(
-            locator.get_surroundings_geometry())
-        store['geojsons']['trees'], store['crs']['trees'] = df_to_json(locator.get_tree_geometry())
-        store['geojsons']['streets'], store['crs']['streets'] = df_to_json(locator.get_street_network())
+            locator.get_surroundings_geometry(), root=scenario)
+        store['geojsons']['trees'], store['crs']['trees'] = df_to_json(locator.get_tree_geometry(), root=scenario)
+        store['geojsons']['streets'], store['crs']['streets'] = df_to_json(locator.get_street_network(), root=scenario)
         # store['geojsons']['dc'], store['connected_buildings']['dc'], store['crs']['dc'] = get_network(config, 'dc')
         # store['geojsons']['dh'], store['connected_buildings']['dh'],  store['crs']['dh'] = get_network(config, 'dh')
         store['geojsons']['dc'] = None
@@ -159,9 +187,239 @@ class InputForm(BaseModel):
     schedules: Dict[str, Any] = Field(default_factory=dict)
 
 
-@router.put('/all-inputs', dependencies=[CEASeverDemoAuthCheck])
-async def save_all_inputs(project_info: CEAProjectInfo, form: InputForm):
-    locator = cea.inputlocator.InputLocator(project_info.scenario)
+class ArchetypeLockForm(BaseModel):
+    locked: bool
+
+
+def remap_and_relock(locator: cea.inputlocator.InputLocator, buildings: list[str]) -> archetype_lock.LockState:
+    """Re-derive the archetype-owned tables for `buildings` and advance the lock timestamp.
+
+    Shared by every path that upholds Archetype Lock's guarantee: (re-)locking the whole
+    district, an auto-remap after `zone.shp` moved a building's archetype key, and an
+    auto-remap after the archetype database itself changed. All three run the same six-flag
+    mapper call and then stamp `mapped_at` to now -- the mapper just ran, so the lock file's
+    record of "last mapped" needs to say so.
+    """
+    archetypes_mapper(
+        locator=locator,
+        update_architecture_dbf=True,
+        update_air_conditioning_systems_dbf=True,
+        update_indoor_comfort_dbf=True,
+        update_internal_loads_dbf=True,
+        update_supply_systems_dbf=True,
+        update_schedule_operation_cea=True,
+        list_buildings=buildings,
+    )
+    return archetype_lock.write_lock(locator, locked=True)
+
+
+@router.get('/archetype-lock')
+async def get_archetype_lock(scenario: CEAScenario):
+    """The lock state, plus the baselines the input editor needs to determine per-building,
+    per-tab drift itself (see `archetype_lock`'s module docstring for why that check lives
+    client-side rather than here). `drifted` is a cheap, coarse fallback only -- it does not
+    reflect a `const_type`-only change or a hand-edited derived table.
+    """
+    locator = cea.inputlocator.InputLocator(scenario)
+
+    def fn():
+        state = archetype_lock.read_lock(locator)
+        return {
+            'locked': state.locked,
+            'drifted': archetype_lock.is_drifted(locator, state),
+            'mapped_at': state.mapped_at,
+            'derived_tabs': list(archetype_lock.ARCHETYPE_DERIVED_TABS),
+            'archetype_key_columns': list(archetype_lock.ARCHETYPE_KEY_COLUMNS),
+            'mapped_use_types': state.mapped_use_types,
+            # Raw column values, not a digest of them -- the client diffs each column against
+            # this with a plain value-equality check (the same one it already uses for
+            # `mapped_use_types` and the lookup tabs), so it needs no column list of its own to
+            # know what to compare: the keys of each building's own baseline are enough.
+            'mapped_computed_values': state.mapped_computed_values,
+        }
+
+    return await run_in_threadpool(fn)
+
+
+@router.put('/archetype-lock')
+async def set_archetype_lock(scenario: CEAScenario, form: ArchetypeLockForm):
+    """Lock or unlock the archetype-derived tables.
+
+    Unlocking changes nothing on disk -- the user simply takes ownership of those tables.
+
+    Locking regenerates all five of them, plus schedules, from each building's archetype, so
+    any edits made while unlocked are lost. The client is expected to have confirmed that;
+    this is the point of no return, not the modal.
+    """
+    locator = cea.inputlocator.InputLocator(scenario)
+
+    def fn():
+        if not form.locked:
+            # Keep the previous `mapped_at`/baselines: unlocking has not just mapped anything,
+            # so there is nothing new to stamp, and dropping them would fall back to the
+            # legacy "no baseline" case and read as drifted regardless of actual content.
+            previous = archetype_lock.read_lock(locator)
+            state = archetype_lock.write_lock(
+                locator, locked=False, mapped_at=previous.mapped_at,
+                mapped_use_types=previous.mapped_use_types,
+                mapped_computed_values=previous.mapped_computed_values)
+            return {'locked': False,
+                    'drifted': archetype_lock.is_drifted(locator, state),
+                    'remapped': False}
+
+        buildings = list(locator.get_zone_building_names())
+        state = remap_and_relock(locator, buildings)
+        return {'locked': True, 'drifted': False, 'remapped': True,
+                'building_count': len(buildings), 'mapped_at': state.mapped_at}
+
+    return await run_in_threadpool(fn)
+
+
+def shapefile_payload_problems(db: str, table: Any, geojson: Any) -> list[str]:
+    """Reasons a shapefile payload must not be written, as user-facing sentences.
+
+    The save writes each table in turn, so anything wrong has to be found before the first
+    write -- a failure discovered halfway leaves the scenario partly updated with the client
+    still holding the version it thought it saved.
+
+    Only what the user just did and can undo:
+
+    - a footprint is malformed (self-intersecting, unclosed). Cannot reach here today, because
+      `df_to_json` fails to read such a file at all and the caller skips the table; the check
+      is what makes editing geometry safe to add.
+    - two rows share a name. The write does `set_index('name')`, so one would silently win.
+
+    A *missing* footprint is deliberately not a reason to refuse. The editor offers no way to
+    give a building one, so rejecting the save would leave deleting the row as the only escape
+    -- the very data loss this guards against. `restore_rows_without_geometry` carries those
+    rows through the write instead, and the banner in the editor says they are there.
+
+    :param db: input name, used in the messages (e.g. ``zone``).
+    :param table: the table as sent by the client, ``{name: {column: value}}``.
+    :param geojson: the matching geojson as sent by the client.
+    :return: problems found, empty when the payload is safe to write.
+    """
+    features = (geojson or {}).get('features')
+    if not features:
+        # Geometry that failed to load is skipped by the caller, not rejected.
+        return []
+
+    try:
+        gdf = geopandas.GeoDataFrame.from_features(
+            features, crs=get_geographic_coordinate_system())
+    except Exception as e:
+        # Deliberately broad. This is arbitrary client input, and the ways it can fail to parse
+        # are open-ended -- shapely alone raises `GeometryTypeError` for an unknown `type`.
+        # Whatever it is, the answer is the same: tell the user we could not read it, rather
+        # than let a traceback out as a 500.
+        return [f"{db}: the geometry sent could not be read ({type(e).__name__}: {e})."]
+
+    problems = []
+    try:
+        validate_geometries_before_crs_transform(
+            gdf, shapefile_name=db, require_geometry=False)
+    except ValueError as e:
+        problems.append(str(e))
+
+    if 'name' not in gdf.columns:
+        return problems
+
+    names = gdf['name'].astype(str)
+
+    duplicated = sorted(set(names[names.duplicated()]))
+    if duplicated:
+        problems.append(
+            f"{db}: more than one row is named {', '.join(duplicated)}. "
+            f"Names must be unique - saving would keep only one row of each.")
+
+    return problems
+
+
+def zone_attribute_problems(table: Any, geojson: Any) -> list[str]:
+    """Reasons the zone's attributes must not be written, as user-facing sentences.
+
+    Runs the same attribute rules as scenario creation and the simulation scripts, so an
+    inconsistent zone (too few metres per storey, a void deck taller than the building, ...)
+    is refused at save rather than failing later when a simulation starts. Footprints are not
+    judged here: the editor keeps rows without one, and `shapefile_payload_problems` covers
+    malformed ones.
+
+    :param table: the zone table as sent by the client, ``{name: {column: value}}``.
+    :param geojson: the matching geojson as sent by the client.
+    :return: problems found, empty when the zone is safe to write.
+    """
+    features = (geojson or {}).get('features')
+    if not features:
+        return []
+
+    try:
+        zone_df = geopandas.GeoDataFrame.from_features(
+            features, crs=get_geographic_coordinate_system())
+        zone_df = restore_rows_without_geometry(zone_df, table)
+    except Exception:
+        # Unreadable geometry is reported by `shapefile_payload_problems`.
+        return []
+
+    # Cells arrive as typed in the editor, so numbers may be strings. A required column that
+    # cannot be read as a number becomes NaN, which `check_na_values` rejects. An optional
+    # one keeps its text instead: coercing it would turn "abc" into a blank, pass, and then
+    # be written to the shapefile as "abc".
+    for column in COLUMNS_ZONE_GEOMETRY + OPTIONAL_COLUMNS_ZONE_GEOMETRY:
+        if column == 'name' or column not in zone_df.columns:
+            continue
+        numbers = pd.to_numeric(zone_df[column], errors='coerce')
+        if column in OPTIONAL_COLUMNS_ZONE_GEOMETRY:
+            numbers = numbers.where(numbers.notna() | zone_df[column].isna(), zone_df[column])
+        zone_df[column] = numbers
+
+    try:
+        verify_zone_attributes(zone_df)
+    except Exception as e:
+        return [f"zone: {e}"]
+    return []
+
+
+def restore_rows_without_geometry(table_df: geopandas.GeoDataFrame, table: Any) -> geopandas.GeoDataFrame:
+    """Put back the rows the client could not send a footprint for.
+
+    `df_to_json` drops null-geometry rows so the map can still draw, while
+    `get_building_properties` keeps them in the table. The shapefile is rebuilt from the
+    features alone, so without this those rows are deleted from the file on the next save --
+    silently, and with their attributes.
+
+    A shapefile stores a null geometry happily and reads it back as `None`, so the row survives
+    a round trip intact and can be fixed or deleted later.
+
+    :param table_df: the frame built from the payload's features.
+    :param table: the table as sent by the client, ``{name: {column: value}}``.
+    :return: `table_df` with any table-only rows appended, geometry unset.
+    """
+    if 'name' not in table_df.columns or not table:
+        return table_df
+
+    present = set(table_df['name'].astype(str))
+    absent = [name for name in table if str(name) not in present]
+    if not absent:
+        return table_df
+
+    logger.warning(
+        f"{len(absent)} row(s) have no footprint and were written without one: "
+        f"{', '.join(map(str, absent))}")
+
+    restored = geopandas.GeoDataFrame(
+        [{**table[name], 'name': name} for name in absent],
+        geometry=[None] * len(absent),
+        crs=table_df.crs,
+    )
+    # Reindexed to the written columns so a stray key in the table cannot add one, and a
+    # column the row never had arrives as NA rather than shifting the frame.
+    restored = restored.reindex(columns=table_df.columns)
+    return pd.concat([table_df, restored], ignore_index=True)
+
+
+@router.put('/all-inputs')
+async def save_all_inputs(scenario: CEAScenario, form: InputForm):
+    locator = cea.inputlocator.InputLocator(scenario)
 
     tables = form.tables
     geojsons = form.geojsons
@@ -169,7 +427,57 @@ async def save_all_inputs(project_info: CEAProjectInfo, form: InputForm):
     schedules = form.schedules
 
     def fn():
-        out = {'tables': {}, 'geojsons': {}}
+        out = {'tables': {}, 'geojsons': {}, 'skipped_tables': []}
+
+        # Archetype Lock. While locked, CEA owns the archetype-derived tables, so the payload's
+        # copies of them are not written.
+        #
+        # This has to happen server-side, not only by grey-ing out the inputs: the editor holds
+        # every table in memory and PUTs all of them on each save, so a client that is merely
+        # *stale* -- one opened before the lock, or one whose copy predates an auto-remap --
+        # would otherwise overwrite tables it never meant to touch.
+        #
+        # Skipped rather than rejected: the derived tables are in every payload, so rejecting
+        # their presence would reject every save. They are reported back in `skipped_tables`
+        # so the UI can say what was ignored, rather than dropping them silently.
+        lock = archetype_lock.read_lock(locator)
+        if lock.locked:
+            for tab in archetype_lock.ARCHETYPE_DERIVED_TABS:
+                if tables.get(tab):
+                    out['skipped_tables'].append(tab)
+                    tables[tab] = None
+
+        # Which buildings changed archetype, decided here rather than trusted from the client.
+        remap_buildings = []
+        if lock.locked and tables.get('zone'):
+            try:
+                existing_zone = geopandas.read_file(locator.get_zone_geometry())
+                existing_zone = pd.DataFrame(existing_zone.drop(columns='geometry')).set_index('name')
+                remap_buildings = archetype_lock.buildings_needing_remap(
+                    tables['zone'], existing_zone)
+            except (IOError, DriverError, ValueError, KeyError, FileNotFoundError) as e:
+                logger.warning(f"Could not compare archetype keys, skipping the re-map: {e}")
+
+        # Nothing is written until every shapefile payload has been checked. The loop below
+        # writes tables one at a time, so a problem found partway through would leave the
+        # scenario half-updated -- and unlike a rejected save, there is no way back from that.
+        geometry_problems = []
+        for db, db_info in INPUTS.items():
+            if db_info['file_type'] == 'shp' and tables.get(db):
+                geometry_problems.extend(
+                    shapefile_payload_problems(db, tables[db], geojsons.get(db)))
+        if tables.get('zone'):
+            geometry_problems.extend(
+                zone_attribute_problems(tables['zone'], geojsons.get('zone')))
+        if geometry_problems:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    'message': 'Nothing was saved: the inputs have problems that would '
+                               'corrupt the scenario or stop it simulating.',
+                    'problems': geometry_problems,
+                },
+            )
 
         # TODO: Maybe save the files to temp location in case something fails
         for db in INPUTS:
@@ -182,8 +490,22 @@ async def save_all_inputs(project_info: CEAProjectInfo, form: InputForm):
 
             if len(tables[db]):
                 if file_type == 'shp':
+                    # The editor sends back what the GET gave it, and the GET builds `tables`
+                    # and `geojsons` from two independent reads. When the geometry read failed
+                    # the table can arrive populated with no geojson beside it; writing the
+                    # shapefile needs the geometry, so skip rather than raise a TypeError from
+                    # `None['features']`.
+                    if not (geojsons.get(db) or {}).get('features'):
+                        logger.warning(
+                            f"Skipping {db}: its rows were sent without any geometry. The "
+                            f"geometry file likely failed to load - check the log from when "
+                            f"the scenario was opened.")
+                        out['tables'][db] = tables[db]
+                        continue
+
                     table_df = geopandas.GeoDataFrame.from_features(geojsons[db]['features'],
                                                                     crs=get_geographic_coordinate_system())
+                    table_df = restore_rows_without_geometry(table_df, tables[db])
                     out['geojsons'][db] = json.loads(table_df.to_json())
                     table_df = table_df.to_crs(crs[db])
                     table_df.to_file(location, driver='ESRI Shapefile', encoding='ISO-8859-1')
@@ -207,13 +529,26 @@ async def save_all_inputs(project_info: CEAProjectInfo, form: InputForm):
 
                     out['tables'][db] = []
 
-                elif os.path.isfile(location):
-                    if file_type == 'shp':
-                        import glob
-                        for filepath in glob.glob(os.path.join(locator.get_building_geometry_folder(), '%s.*' % db)):
-                            os.remove(filepath)
-                    elif file_type == 'dbf':
-                        os.remove(location)
+                else:
+                    if os.path.isfile(location):
+                        if file_type == 'shp':
+                            import glob
+                            for filepath in glob.glob(os.path.join(locator.get_building_geometry_folder(), '%s.*' % db)):
+                                os.remove(filepath)
+                        elif file_type in ('dbf', 'csv'):
+                            # `csv` was missing here: a cleared derived table (envelope,
+                            # internal-loads, indoor-comfort, hvac, supply) never actually lost
+                            # its file, so the stale rows survived on disk under a response that
+                            # (once reported at all) claimed the table was empty.
+                            os.remove(location)
+
+                    # Report the clearing, same as the `surroundings` branch above -- the
+                    # response is a complete echo of every table's new state, not just the
+                    # ones that ended up with rows. A key silently missing here would read as
+                    # "this save didn't touch it" and leave a stale, non-empty table sitting
+                    # in the client's cache (see `useSaveInputs.js`, which trusts this response
+                    # instead of refetching).
+                    out['tables'][db] = {}
 
                 if file_type == 'shp':
                     out['geojsons'][db] = {}
@@ -234,9 +569,52 @@ async def save_all_inputs(project_info: CEAProjectInfo, form: InputForm):
                 save_cea_schedules(data.to_dict('list'), schedule_path)
                 print('Schedule file written to {}'.format(schedule_path))
 
+        if lock.locked:
+            if remap_buildings:
+                # Only the buildings whose archetype moved, or that are new. `archetypes_mapper`
+                # merges a subset into the existing tables rather than replacing them, so the
+                # rest of the district is left alone -- and a district-wide re-derive on every
+                # `const_type` edit would be needlessly slow for a large scenario. A save with
+                # no archetype changes never reaches this branch, so the lock file is untouched.
+                remap_and_relock(locator, remap_buildings)
+                out['remapped_buildings'] = remap_buildings
+
+                # Hand back what the mapper wrote. Without this the client keeps the values it
+                # sent, and its next save would write them straight back over the re-map.
+                for tab in archetype_lock.ARCHETYPE_DERIVED_TABS:
+                    tab_location = getattr(locator, INPUTS[tab]['location'])()
+                    if os.path.isfile(tab_location):
+                        remapped = pd.read_csv(tab_location)
+                        out['tables'][tab] = json.loads(
+                            remapped.set_index('name').to_json(orient='index'))
+
         return out
 
-    return await run_in_threadpool(fn)
+    result = await run_in_threadpool(fn)
+    await _mark_state_custom_if_child(scenario)
+    return result
+
+
+async def _mark_state_custom_if_child(scenario: str) -> None:
+    """Mark a pathway state as custom after a save inside it (inputs or database).
+
+    The pathway viewer then shows it in purple, bake leaves it alone instead of rebuilding it
+    from the parent scenario's inputs, and Simulate Pathway re-runs it.
+    """
+    child_scenario = PathwayChildScenario.parse(scenario)
+    if child_scenario is None:
+        return
+    from cea.datamanagement.district_pathways.pathway_status import record_custom_state
+    parent_locator = cea.inputlocator.InputLocator(child_scenario.parent)
+    try:
+        await run_in_threadpool(
+            record_custom_state,
+            parent_locator,
+            pathway_name=child_scenario.pathway_name,
+            year=child_scenario.year,
+        )
+    except OSError:
+        pass
 
 
 def _build_choices_cache(locator):
@@ -266,7 +644,9 @@ def get_building_properties(scenario: str):
         file_type = db_info['file_type']
         db_columns = db_info['columns']
 
-        # Get building property data from file
+        # Get building property data from file. `available_columns` stays empty if the read
+        # fails, which is fine: the table is None then, so there is nothing to render anyway.
+        available_columns = set()
         try:
             if file_type == 'shp':
                 if not os.path.exists(file_path):
@@ -278,20 +658,32 @@ def get_building_properties(scenario: str):
                     del db_columns['geometry']
                 if 'reference' in db_columns and 'reference' not in table_df.columns:
                     table_df['reference'] = None
+                available_columns = set(table_df.columns)
                 store['tables'][db] = json.loads(table_df.set_index('name').to_json(orient='index'))
             else:
                 table_df = pd.read_csv(file_path)
                 if 'reference' in db_columns and 'reference' not in table_df.columns:
                     table_df['reference'] = None
+                available_columns = set(table_df.columns)
                 store['tables'][db] = table_df.set_index("name").to_dict(orient='index')
         except (IOError, DriverError, ValueError, FileNotFoundError) as e:
             logger.warning(f"Error reading {db} from {file_path}: {e}")
             store['tables'][db] = None
 
         # Get column definitions from schema
+        #
+        # `void_deck` is deprecated in favour of `height_vd`, so it is advertised only to
+        # scenarios that already carry it. A scenario CEA generates today has `height_vd` and
+        # never had `void_deck`; offering the legacy column there would show two columns for
+        # one concept and invite new data into the form being retired. `height_vd` is always
+        # advertised, so an older scenario can opt into metres.
+        hide_deprecated_void_deck = VOID_FLOORS_COLUMN not in available_columns
+
         columns = defaultdict(dict)
         try:
             for column_name, column in db_columns.items():
+                if hide_deprecated_void_deck and column_name == VOID_FLOORS_COLUMN:
+                    continue
                 columns[column_name]['type'] = column['type']
                 if 'choice' in column:
                     lookup_path_method = column['choice']['lookup']['path']
@@ -299,14 +691,9 @@ def get_building_properties(scenario: str):
                     path, choices = choices_cache[(lookup_path_method, lookup_col)]
                     columns[column_name]['path'] = path
                     columns[column_name]['choices'] = choices
-                if 'constraints' in column:
-                    columns[column_name]['constraints'] = column['constraints']
-                if 'regex' in column:
-                    columns[column_name]['regex'] = column['regex']
-                    if 'example' in column:
-                        columns[column_name]['example'] = column['example']
-                if 'nullable' in column:
-                    columns[column_name]['nullable'] = column['nullable']
+                for key in FORWARDED_COLUMN_KEYS:
+                    if key in column:
+                        columns[column_name][key] = column[key]
 
                 columns[column_name]['description'] = column["description"]
                 columns[column_name]['unit'] = column["unit"]
@@ -347,11 +734,11 @@ def get_network(scenario: str, network_type):
         edges = locator.get_network_layout_edges_shapefile(network_type, network_name)
         nodes = locator.get_network_layout_nodes_shapefile(network_type, network_name)
 
-        network_json, crs = df_to_json(edges)
+        network_json, crs = df_to_json(edges, root=scenario)
         if network_json is None:
             return None, [], None
 
-        nodes_json, _ = df_to_json(nodes)
+        nodes_json, _ = df_to_json(nodes, root=scenario)
         network_json['features'].extend(nodes_json['features'])
         network_json['properties'] = {'connected_buildings': connected_buildings}
         return network_json, connected_buildings, crs
@@ -363,15 +750,37 @@ def get_network(scenario: str, network_type):
         return None, [], None
 
 
-def df_to_json(file_location):
+def df_to_json(file_location, root=None):
     from cea.utilities.standardize_coordinates import get_lat_lon_projected_shapefile, get_projected_coordinate_system
 
     try:
-        file_location = secure_path(file_location)
+        file_location = secure_path(file_location, root=root)
         if not os.path.exists(file_location):
             raise FileNotFoundError(f"File not found: {file_location}")
 
         table_df = geopandas.GeoDataFrame.from_file(file_location)
+
+        # Drop rows with no geometry, for display only.
+        #
+        # `get_lat_lon_projected_shapefile` rejects the whole file if any row fails validation,
+        # so a single row with a null footprint blanks the entire map -- every other building
+        # included -- while the table beside it still lists them all. For the editor it is more
+        # useful to draw what can be drawn and say what was left out; the row stays in the
+        # table, which is where the user can fix or delete it.
+        #
+        # Simulation scripts call the validator directly and still refuse to run, which is
+        # right: a missing footprint is a real error, not a display inconvenience.
+        missing_geometry = table_df.geometry.isna()
+        if missing_geometry.any():
+            names = table_df.loc[missing_geometry].get('name')
+            logger.warning(
+                f"{int(missing_geometry.sum())} row(s) in {os.path.basename(file_location)} "
+                f"have no geometry and are not drawn on the map"
+                + (f": {', '.join(map(str, names))}" if names is not None else "")
+                + ". They remain in the table - give them a footprint or delete them."
+            )
+            table_df = table_df.loc[~missing_geometry]
+
         # Save coordinate system
         if table_df.empty:
             # Set crs to generic projection if empty
@@ -388,16 +797,19 @@ def df_to_json(file_location):
         out = json.loads(out.to_json())
         return out, crs
     except (IOError, DriverError, FileNotFoundError) as e:
-        print(e)
+        # Through the logger, naming the file. Returning None here is invisible until a later
+        # save trips over it -- `save_all_inputs` reads `geojsons[db]['features']` -- so the
+        # 500 it eventually raises points at the save, not at whatever actually failed here.
+        logger.warning(f"Could not read geometry for the Input Editor from {file_location}: {e}")
         return None, None
     except Exception:
-        traceback.print_exc()
+        logger.exception(f"Could not read geometry for the Input Editor from {file_location}")
         return None, None
 
 
 @router.get('/building-schedule/{building}')
-async def get_building_schedule(project_info: CEAProjectInfo, building: str):
-    locator = cea.inputlocator.InputLocator(project_info.scenario)
+async def get_building_schedule(scenario: CEAScenario, building: str):
+    locator = cea.inputlocator.InputLocator(scenario)
     try:
         schedule_data, schedule_complementary_data = read_cea_schedule(locator, use_type=None, building=building)
         df = pd.DataFrame(schedule_data).set_index(['hour'])
@@ -415,10 +827,12 @@ async def get_building_schedule(project_info: CEAProjectInfo, building: str):
 
 
 @router.get('/databases')
-async def get_input_database_data(project_info: CEAProjectInfo):
-    locator = cea.inputlocator.InputLocator(project_info.scenario)
+async def get_input_database_data(scenario: CEAScenario):
+    locator = cea.inputlocator.InputLocator(scenario)
     try:
-        cea_db = await run_in_threadpool(lambda: CEADatabase.from_locator(locator))
+        # Lenient: a database with a broken row must still open, or the user cannot reach the
+        # editor to fix it. `/databases/check` reports what is wrong.
+        cea_db = await run_in_threadpool(lambda: CEADatabase.from_locator(locator, strict=False))
     except CEADatabaseException as e:
         print(e)
         raise HTTPException(
@@ -434,15 +848,87 @@ async def get_input_database_data(project_info: CEAProjectInfo):
     return cea_db.to_dict()
 
 
-@router.put('/databases', dependencies=[CEASeverDemoAuthCheck])
-async def put_input_database_data(project_info: CEAProjectInfo, payload: Dict[str, Any]):
-    locator = cea.inputlocator.InputLocator(project_info.scenario)
+@router.put('/databases')
+async def put_input_database_data(
+    scenario: CEAScenario,
+    payload: Dict[str, Any],
+    overwrite_derived: bool = False,
+):
+    """Save the database, deriving envelope U/GHG values from the material layers.
+
+    A row whose stored U/GHG disagree with its layers is reported as a conflict and the whole
+    save is refused (409) unless `overwrite_derived` is set. Refusing everything rather than
+    the offending rows keeps the file consistent with what the user last saw: a partial save
+    would leave the editor showing values that were not written.
+
+    While Archetype Lock is on, this also re-runs `archetypes_mapper` for the buildings whose
+    `const_type` or `use_type` archetype just changed -- the mapper reads this database, so
+    without this a locked scenario would silently keep every building mapped against the old
+    values (see `docs/developer/archetype-lock-drift-review.md`). Unlocked, nothing here
+    changes: the user owns the derived tables and the mapper is not run.
+    """
+    locator = cea.inputlocator.InputLocator(scenario)
     try:
         def fn():
+            lock = archetype_lock.read_lock(locator)
+            # Snapshot before the write -- once `db.save` runs, the old values are gone and
+            # there is nothing left to diff against.
+            existing_archetypes = Archetypes.from_locator(locator) if lock.locked else None
+
             db = CEADatabase.from_dict(payload)
+            materials = getattr(db.components.materials, 'materials', None)
+            conflicts = db.assemblies.envelope.apply_material_derivation(materials)
+            if conflicts and not overwrite_derived:
+                return {'conflicts': conflicts}
             db.save(locator)
-            return {'message': 'Database updated'}
-        return await run_in_threadpool(fn)
+
+            result = {}
+            if lock.locked:
+                const_types, use_types = archetype_lock.changed_archetype_codes(
+                    db.archetypes, existing_archetypes)
+                buildings = []
+                if const_types or use_types:
+                    try:
+                        zone_df = geopandas.read_file(locator.get_zone_geometry())
+                        buildings = archetype_lock.buildings_using_archetypes(
+                            zone_df, const_types=const_types, use_types=use_types)
+                    except (IOError, DriverError, ValueError, KeyError, FileNotFoundError) as e:
+                        logger.warning(f"Could not compare archetype codes, skipping the re-map: {e}")
+                if buildings:
+                    try:
+                        remap_and_relock(locator, buildings)
+                        result['remapped_buildings'] = buildings
+                    except Exception as e:
+                        # The database is already saved and `CEADatabase.save` has no
+                        # rollback, so a mapper failure here (e.g. a building still
+                        # references a `const_type` that was just deleted) must not report
+                        # a successful write as a failure.
+                        logger.warning(f"Archetype re-map after database save failed: {e}")
+                        result['remap_error'] = str(e)
+            return result
+
+        result = await run_in_threadpool(fn)
+        conflicts = result.get('conflicts')
+        if conflicts:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    'status': 'derived_conflict',
+                    'message': (
+                        f'{len(conflicts)} value(s) disagree with their material layers by more '
+                        f'than {CROSS_CHECK_REL_TOLERANCE:.0%}. Material layers are the source of '
+                        f'truth, so saving replaces them with values derived from the layers.'
+                    ),
+                    'conflicts': conflicts,
+                },
+            )
+        await _mark_state_custom_if_child(scenario)
+        response = {'message': 'Database updated'}
+        if result.get('remapped_buildings'):
+            response['remapped_buildings'] = result['remapped_buildings']
+        if result.get('remap_error'):
+            response['remap_error'] = result['remap_error']
+        return response
     except CEADatabaseException as e:
         print(e)
         raise HTTPException(
@@ -451,12 +937,59 @@ async def put_input_database_data(project_info: CEAProjectInfo, payload: Dict[st
         )
 
 
-@router.post('/databases/upload', dependencies=[CEASeverDemoAuthCheck])
-async def upload_input_database(project_info: CEAProjectInfo, file: UploadFile):
-    locator = cea.inputlocator.InputLocator(project_info.scenario)
+class SeedMaterialsDatabase(BaseModel):
+    source: Literal['CH']
+
+
+# Maps each allowed `source` literal to its region-database folder name. A dict lookup
+# keeps the path segment bounded to a hardcoded set of values instead of interpolating
+# the request payload directly, so static analysis (and any future literal added here)
+# can't mistake it for an unbounded, user-controlled path component.
+_MATERIALS_SEED_SOURCE_FOLDERS = {'CH': 'CH'}
+
+
+@router.post('/databases/components/materials')
+async def seed_materials_database(scenario: CEAScenario, payload: SeedMaterialsDatabase):
+    """Give a scenario a MATERIALS.csv it does not have yet."""
+    # Only the CH database ships one, and every existing copy path is folder-granular
+    # (`database_helper` copytree's the whole COMPONENTS tree, clobbering the siblings).
+    locator = cea.inputlocator.InputLocator(scenario)
+    # Contain the derived path under the scenario before touching the filesystem: CEAScenario
+    # sanitises `scenario` itself, but that doesn't statically prove to a scanner that a path
+    # a locator method derives from it stays inside the scenario too.
+    destination = locator.get_database_components_materials()
+    destination = validate_path_within_root(destination, scenario)
+    if os.path.exists(destination):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This scenario already has a materials database.",
+        )
+
+    # Mirror the destination's own sub-path inside the region database, so moving the file
+    # is a locator change rather than a locator change plus this literal.
+    source = os.path.join(
+        databases_folder_path,
+        _MATERIALS_SEED_SOURCE_FOLDERS[payload.source],
+        os.path.relpath(destination, locator.get_db4_folder()),
+    )
+
+    def do_copy():
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        shutil.copyfile(source, destination)
+
+    await run_in_threadpool(do_copy)
+    await _mark_state_custom_if_child(scenario)
+
+    return {'source': payload.source}
+
+
+@router.post('/databases/upload')
+async def upload_input_database(scenario: CEAScenario, file: UploadFile):
+    locator = cea.inputlocator.InputLocator(scenario)
 
     # Create a lock file path specific to this scenario
-    lock_file_path = os.path.join(tempfile.gettempdir(), f'cea_db_upload_{hash(project_info.scenario)}.lock')
+    scenario_id = hashlib.sha256(scenario.encode('utf-8')).hexdigest()
+    lock_file_path = os.path.join(tempfile.gettempdir(), f'cea_db_upload_{scenario_id}.lock')
 
     def do_upload():
         """Perform the upload operation with file-based locking"""
@@ -490,14 +1023,15 @@ async def upload_input_database(project_info: CEAProjectInfo, file: UploadFile):
                         # Normalize and validate the path to prevent directory traversal attacks
                         member_path = os.path.normpath(adjusted_filename)
 
-                        # Construct the full target path
-                        target_path = os.path.join(temp_db_folder, member_path)
-
-                        # Verify the resolved path is within the target directory
-                        target_path_resolved = os.path.realpath(target_path)
-                        db_folder_resolved = os.path.realpath(temp_db_folder)
-
-                        if os.path.isabs(member_path) or '..' in member_path.split(os.sep) or not target_path_resolved.startswith(db_folder_resolved + os.sep):
+                        # Construct the full target path and enforce root containment
+                        if os.path.isabs(member_path) or '..' in member_path.split(os.sep):
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f'Invalid ZIP file: {adjusted_filename}',
+                            )
+                        try:
+                            target_path = secure_join_under_root(temp_db_folder, member_path)
+                        except OutsideProjectRootError:
                             raise HTTPException(
                                 status_code=status.HTTP_400_BAD_REQUEST,
                                 detail=f'Invalid ZIP file: {adjusted_filename}',
@@ -558,11 +1092,13 @@ async def upload_input_database(project_info: CEAProjectInfo, file: UploadFile):
 
         return {'message': 'Database uploaded successfully'}
 
-    return await run_in_threadpool(do_upload)
+    result = await run_in_threadpool(do_upload)
+    await _mark_state_custom_if_child(scenario)
+    return result
 
-@router.get('/databases/download', dependencies=[CEASeverDemoAuthCheck])
-async def download_input_database(project_info: CEAProjectInfo):
-    locator = cea.inputlocator.InputLocator(project_info.scenario)
+@router.get('/databases/download')
+async def download_input_database(scenario: CEAScenario):
+    locator = cea.inputlocator.InputLocator(scenario)
     filename = 'database.zip'
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -597,10 +1133,8 @@ async def download_input_database(project_info: CEAProjectInfo):
 
 # Move to database route
 @router.get('/databases/check')
-async def check_input_database(project_info: CEAProjectInfo):
+async def check_input_database(scenario: CEAScenario):
     """Check if the databases are valid"""
-    scenario = project_info.scenario
-
     try:
         verify_database(scenario)
         return {'status': 'success', 'message': True}
@@ -693,38 +1227,6 @@ def get_choices(choice_properties, path):
             label = 'none'
         out.append({'value': choice, 'label': label})
     return out
-
-
-class FileLock:
-    """Cross-process file-based lock using platform-specific file locking"""
-    def __init__(self, lock_file_path):
-        self.lock_file_path = lock_file_path
-        self.lock_file = None
-
-    def __enter__(self):
-        self.lock_file = open(self.lock_file_path, 'w')
-        if sys.platform == 'win32':
-            import msvcrt
-            # Lock the file on Windows
-            msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-            # Lock the file on Unix-like systems
-            fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX)
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.lock_file:
-            if sys.platform == 'win32':
-                import msvcrt
-                # Unlock the file on Windows
-                msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                # Unlock the file on Unix-like systems
-                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
-            self.lock_file.close()
-        return False
 
 
 def verify_database(scenario: str):

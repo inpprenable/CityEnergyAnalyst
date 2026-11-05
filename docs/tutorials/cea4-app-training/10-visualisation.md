@@ -23,12 +23,11 @@ Creates bar charts of building energy demand results, showing heating, cooling, 
 - Electricity (E) - appliances, lighting, auxiliaries
 - Domestic hot water (Qww)
 
-**Chart Types Available**:
-1. **Annual demand** - Total MWh/year per building (stacked bar)
-2. **Energy intensity** - kWh/m²/year per building (normalised)
-3. **Peak loads** - Maximum kW per building
-4. **Time series** - Hourly demand profiles (line charts)
-5. **Monthly aggregation** - Seasonal patterns
+**Views Available** (via X to plot, Y normalised by and Plot type):
+1. **Per building** - Totals per building, stacked or grouped by service
+2. **Energy intensity** - Normalised by gross or conditioned floor area
+3. **Faceted** - By months, seasons, construction type, or main use type
+4. **District time series** - Hourly, daily, monthly, seasonal, or annual totals
 
 ### Prerequisites
 - **Energy Demand Part 2** completed
@@ -38,10 +37,12 @@ Creates bar charts of building energy demand results, showing heating, cooling, 
 
 | Parameter | Description | Options |
 |-----------|-------------|---------|
-| **Chart type** | Type of visualisation | Annual / Intensity / Peaks / Time series / Monthly |
-| **Building filter** | Which buildings to include | All / Selected / By type |
-| **Energy services** | Which services to show | All / Heating / Cooling / Electricity |
-| **Stacked vs grouped** | Bar chart style | Stacked (default) / Grouped |
+| **Y metric to plot** | End-use services to show | electricity / space_heating / space_cooling / domestic_hot_water |
+| **Y metric unit** | Unit | MWh / kWh (default) / Wh |
+| **Y normalised by** | Normalisation | no_normalisation / gross_floor_area (default) / conditioned_floor_area |
+| **X to plot** | X-axis grouping | building (default), faceted by months, seasons, construction type, etc. |
+| **Plot type** | Bar chart style | bar_plot_stack (default) / bar_plot_group / bar_plot_stack_percentage |
+| **Buildings** and building filters | Which buildings to include | All, or filter by year, construction type, use type |
 
 ### How to Use
 
@@ -50,23 +51,23 @@ Creates bar charts of building energy demand results, showing heating, cooling, 
 2. **Run plot generation**:
    - Navigate to **Visualisation**
    - Select **Plot - Building Energy Demand**
-   - Choose chart type (start with "Annual demand")
-   - Select buildings (or use "All")
-   - Choose whether to stack or group energy services
+   - Choose services (Y metric to plot), unit and normalisation
+   - Choose the X-axis grouping (start with `building`)
+   - Select buildings (or leave blank for all)
+   - Choose plot type (stacked, grouped, or stacked percentage)
    - Click **Run**
 
 3. **View results**:
-   - Charts saved to `{scenario}/outputs/plots/demand/`
-   - Interactive HTML plots (open in browser)
-   - Static PNG/PDF (for presentations)
+   - The interactive chart is shown in the app (not saved to the scenario folder)
+   - Hover for values; zoom, pan, or download a PNG from the chart toolbar
 
 ### Chart Interpretation
 
 **Annual Demand Bar Chart**:
 - Height = total energy (MWh/year)
-- Colors = energy services (heating, cooling, electricity, DHW)
+- Colours = energy services (heating, cooling, electricity, DHW)
 - Taller bars = higher energy consumers
-- Color distribution shows energy mix
+- Colour distribution shows energy mix
 
 **Energy Intensity**:
 - Normalises by floor area (kWh/m²/year)
@@ -84,11 +85,11 @@ Creates bar charts of building energy demand results, showing heating, cooling, 
 
 ### Customisation Options
 
-- **Colors**: Customise color scheme for energy services
+- **Colours**: Customise colour scheme for energy services
 - **Sorting**: Sort buildings by total demand, name, or type
 - **Labels**: Show/hide data labels on bars
 - **Legend**: Position and format
-- **Export format**: HTML (interactive), PNG, PDF, SVG
+- **Export**: Plots are interactive HTML in the app; download a PNG from the chart toolbar. HTML files are only written when you export a canvas archive
 
 ### Tips
 - **Start with annual demand**: Best overview of results
@@ -108,9 +109,9 @@ Creates bar charts of building energy demand results, showing heating, cooling, 
 
 ---
 
-## Plot - Final Energy
+## Plot - Energy by Carrier
 
-See [Final Energy > Plot - Final Energy](06-1-final-energy.md#plot---final-energy) for full documentation.
+See [Final Energy > Plot - Energy by Carrier](06-1-final-energy.md#plot---energy-by-carrier) for full documentation.
 
 Bar charts of final energy consumption by carrier (grid, gas, oil, coal, wood) for buildings and plants under a what-if scenario.
 
@@ -140,17 +141,17 @@ Bar charts of operational emissions by service or energy carrier, with solar off
 
 ---
 
-## Plot - Cost Sankey
+## Plot - System Cost Sankey
 
-See [System Costs > Plot - Cost Sankey](06-3-system-costs.md#plot---cost-sankey) for full documentation.
+See [System Costs > Plot - System Cost Sankey](06-3-system-costs.md#plot---system-cost-sankey) for full documentation.
 
 Sankey diagram showing cost flows from components through services to total costs, with annualised or total CAPEX views.
 
 ---
 
-## Plot - Heat Rejection
+## Plot - Anthropogenic Heat Rejection
 
-See [Heat Rejection > Plot - Heat Rejection](06-4-heat-rejection.md#plot---heat-rejection) for full documentation.
+See [Heat Rejection > Plot - Anthropogenic Heat Rejection](06-4-heat-rejection.md#plot---anthropogenic-heat-rejection) for full documentation.
 
 Bar charts of waste heat rejected to the environment by buildings and district plants.
 
@@ -174,11 +175,10 @@ Creates bar charts of solar energy technology potential (PV, PVT, solar collecto
 - PVT: Electricity + heat generation
 - Solar collectors: Heat generation (MWh/year)
 
-**Chart Types**:
-1. **Annual generation** - Total MWh/year by technology
-2. **Installed capacity** - kWp (PV/PVT) or m² (SC)
-3. **Technology comparison** - PV vs PVT vs SC side-by-side
-4. **Specific yield** - kWh/kWp/year or kWh/m²/year
+**Views**:
+1. **By surface** - Roofs and north/east/south/west walls (Y metric to plot)
+2. **Normalised** - Per gross floor area or per installed panel area of each surface
+3. **Per building or district time series** - Via X to plot
 
 ### Prerequisites
 - At least one solar technology assessment completed:
@@ -193,11 +193,11 @@ Creates bar charts of solar energy technology potential (PV, PVT, solar collecto
 2. **Generate plots**:
    - Navigate to **Visualisation**
    - Select **Plot - Solar Technology**
-   - Choose technologies to include
-   - Select chart type
+   - Choose surfaces (Y metric to plot), unit and normalisation
+   - Choose the X-axis grouping
    - Click **Run**
 
-3. **Outputs**: `{scenario}/outputs/plots/solar/`
+3. **Output**: The interactive chart is shown in the app (not saved to the scenario folder). See [Saving and Sharing Plots](#saving-and-sharing-plots).
 
 ### Chart Interpretation
 
@@ -244,13 +244,13 @@ Plots comfort and discomfort hours for buildings based on thermal comfort analys
 - By building and by zone (if multi-zone)
 
 **Comfort Standards**:
-- Based on setpoints in `comfort.xlsx`
+- Based on setpoints in `indoor_comfort.csv`
 - Typically ASHRAE 55 or EN 15251 criteria
 - Adaptive comfort models (if configured)
 
 ### Prerequisites
 - Energy Demand Part 2 completed
-- Comfort setpoints defined in `comfort.xlsx`
+- Comfort setpoints defined in `indoor_comfort.csv`
 
 ### How to Use
 
@@ -262,7 +262,7 @@ Plots comfort and discomfort hours for buildings based on thermal comfort analys
    - Select buildings
    - Click **Run**
 
-3. **Outputs**: `{scenario}/outputs/plots/comfort/`
+3. **Output**: The interactive chart is shown in the app (not saved to the scenario folder). See [Saving and Sharing Plots](#saving-and-sharing-plots).
 
 ### Chart Types
 
@@ -303,7 +303,7 @@ Plots comfort and discomfort hours for buildings based on thermal comfort analys
 Plots Pareto frontiers from optimisation results, visualising trade-offs between competing objectives (cost, emissions, energy).
 
 ### When to Use
-- After running [Supply System Optimisation](07-supply-optimisation.md)
+- After running [District Supply System Optimisation](07-supply-optimisation.md#district-supply-system-optimisation)
 - Presenting optimisation results
 - Supporting multi-objective decision-making
 - Showing cost-carbon trade-offs
@@ -311,10 +311,9 @@ Plots Pareto frontiers from optimisation results, visualising trade-offs between
 ### What It Plots
 
 **Optimisation Objectives**:
-- Typically 2D or 3D scatter plots
-- X-axis: Total annualised cost (CHF/year or $/year)
-- Y-axis: Total GHG emissions (kgCO₂e/year)
-- Optionally Z-axis: Primary energy (MWh/year)
+- The objective functions selected when the optimisation was run (`cost`, `GHG_emissions`, `system_energy_demand`, `anthropogenic_heat`)
+- One 2D scatter plot per pair of objectives
+- An additional 3D plot when three objectives were optimised
 
 **Points on Chart**:
 - **Pareto optimal solutions**: Non-dominated solutions (on frontier)
@@ -322,28 +321,22 @@ Plots Pareto frontiers from optimisation results, visualising trade-offs between
 - **Reference solutions**: Baseline, current state
 
 ### Prerequisites
-- Building-scale or District-scale optimisation completed
+- District Supply System Optimisation completed
 
 ### Key Parameters
 
-| Parameter | Description | Options |
-|-----------|-------------|---------|
-| **Objectives to plot** | Which objectives on axes | Cost vs Emissions (default) / Cost vs Energy / 3D |
-| **Highlight solutions** | Mark specific solutions | Min cost / Min emissions / Compromise |
-| **Reference point** | Show baseline | Current system / No optimisation |
+None besides the scenario. The axes follow the objective functions of the optimisation run.
 
 ### How to Use
 
-1. **Complete optimisation** (building or district scale)
+1. **Complete District Supply System Optimisation**
 
 2. **Generate Pareto plot**:
    - Navigate to **Visualisation**
    - Select **Plot - Pareto Front**
-   - Choose objectives for axes
-   - Optionally highlight key solutions
    - Click **Run**
 
-3. **Outputs**: `{scenario}/outputs/plots/optimisation/pareto_front/`
+3. **Output**: The interactive chart is shown in the app (not saved to the scenario folder). See [Saving and Sharing Plots](#saving-and-sharing-plots).
 
 ### Chart Interpretation
 
@@ -365,15 +358,64 @@ Plots Pareto frontiers from optimisation results, visualising trade-offs between
 
 ### Customisation
 
-- **Color by technology**: Show which technologies appear in solutions
+- **Colour by technology**: Show which technologies appear in solutions
 - **Size by objective**: Third objective as marker size
 - **Annotate**: Label key solutions
 
 ### Tips
 - **Show current state**: Add reference point for context
 - **Calculate trade-off rate**: Cost increase per ton CO₂ reduction
-- **Interactive plots**: HTML allows hovering to see solution details
+- **Interactive plots**: Hover over the plot to see solution details
 - **Multiple scenarios**: Overlay Pareto fronts to compare
+
+---
+
+## Plot - Pathway Emission Timeline
+
+Cumulative lifecycle emissions for one **district pathway**, across its state years, broken
+down by source. The pathway equivalent of Plot - Emission Timeline.
+
+Requires a pathway with simulated states — see
+[District Evolution Pathways](11-district-pathways.md).
+
+---
+
+## Plot - Cost Breakdown
+
+Cost breakdown for energy supply systems. Supports both **baseline costs** and **what-if
+scenario costs**, so it can be used before or after a what-if has been defined.
+
+See [LCA Part 2b: Costs](06-3-system-costs.md) for the underlying results.
+
+---
+
+## Plot - Energy Flow Sankey
+
+Annual energy flows for a what-if scenario as a Sankey diagram, running from energy carrier
+through conversion to end use. Use it to see where carriers enter the district and what they
+ultimately serve.
+
+See [LCA Part 1: Energy by Carrier](06-1-final-energy.md) for the underlying results.
+
+---
+
+## Plot - Load Duration Curve by Component
+
+One load duration curve per selected supply component — annual hourly loads sorted from
+highest to lowest. Reading the curve tells you how a component is actually used: a steep,
+short curve indicates peaking duty, a long flat one indicates base load.
+
+Useful for sanity-checking sizing before reading cost results.
+
+See [LCA Part 1: Energy by Carrier](06-1-final-energy.md) for the underlying results.
+
+---
+
+## Plot - Supply System
+
+Plots the components of energy supply systems, showing what the optimisation selected.
+
+See [Energy Supply System Optimisation](07-supply-optimisation.md).
 
 ---
 
@@ -388,12 +430,12 @@ After completing CEA analyses:
    - Validate results before proceeding
 
 2. **Life Cycle Analysis Plots** (per what-if scenario):
-   - [Plot - Final Energy](06-1-final-energy.md#plot---final-energy) (carrier breakdown)
+   - [Plot - Energy by Carrier](06-1-final-energy.md#plot---energy-by-carrier) (carrier breakdown)
    - [Plot - Lifecycle Emissions](06-2-emissions.md#plot---lifecycle-emissions) (full lifecycle carbon)
    - [Plot - Emission Timeline](06-2-emissions.md#plot---emission-timeline) (cumulative trajectory)
    - [Plot - Operational Emissions](06-2-emissions.md#plot---operational-emissions) (operational carbon)
-   - [Plot - Cost Sankey](06-3-system-costs.md#plot---cost-sankey) (cost flow diagram)
-   - [Plot - Heat Rejection](06-4-heat-rejection.md#plot---heat-rejection) (waste heat)
+   - [Plot - System Cost Sankey](06-3-system-costs.md#plot---system-cost-sankey) (cost flow diagram)
+   - [Plot - Anthropogenic Heat Rejection](06-4-heat-rejection.md#plot---anthropogenic-heat-rejection) (waste heat)
 
 3. **Renewable Energy Plots**:
    - Plot - Solar Technology (if solar assessments done)
@@ -404,22 +446,14 @@ After completing CEA analyses:
 5. **Optimisation Plots** (if optimisation done):
    - Plot - Pareto Front (show trade-offs and optimal solutions)
 
-### Creating Presentation Packages
+### Saving and Sharing Plots
 
-**For Reports**:
-- Export as PNG or PDF (300 dpi)
-- Use consistent color schemes
-- Include data tables with charts
+Plots are generated on demand and shown in the app; CEA does not write plot files to the scenario folder. HTML plot files are only produced inside exported canvas archives (`data/<cardId>/plot_<i>.html`).
 
-**For Presentations**:
-- Export as SVG for scaling
-- Use interactive HTML for workshops
-- Highlight key findings with annotations
-
-**For Publications**:
-- Export vector formats (SVG, PDF)
-- Follow journal style guidelines
-- Provide source data
+- **Image**: Hover over a chart and use the camera icon in the chart toolbar to download a PNG
+- **Side-by-side views**: Arrange plots and maps in the [Canvas Builder](12-canvas-builder.md)
+- **Underlying data**: Use [Export Results to .csv (Summary & Analytics)](01-import-export.md#export-results-to-csv-summary--analytics) to get the numbers behind a chart
+- **Publication figures**: CEA has no SVG or PDF export; rebuild the chart from the exported .csv in your own plotting tool
 
 ---
 
@@ -429,7 +463,7 @@ After completing CEA analyses:
 - **Clear titles**: Describe what is shown
 - **Axis labels**: Include units
 - **Legend**: Essential for multi-series charts
-- **Colors**: Use colorblind-friendly palettes
+- **Colours**: Use colour-blind-friendly palettes
 - **Annotations**: Highlight key findings
 
 ### Data Presentation
@@ -449,21 +483,14 @@ After completing CEA analyses:
 
 ## Customising Plots
 
-### Configuration Files
-Advanced users can customise plot appearance via configuration files:
-- Color schemes
-- Chart dimensions
-- Font sizes
-- Export formats
-
-See CEA documentation for details on plot configuration.
+### Plot Parameters
+Most bar-chart plot tools expose their appearance settings as parameters: plot title, axis labels, Y-axis range and step, plot type (stacked, grouped, or stacked percentage), X-axis grouping and sorting, and faceting.
 
 ### Post-Processing
 For publication-quality figures:
-1. Export as SVG
-2. Edit in Inkscape or Adobe Illustrator
-3. Adjust fonts, colors, labels as needed
-4. Export to required format
+1. Export the data with Export Results to .csv (Summary & Analytics)
+2. Recreate the chart in your own plotting tool
+3. Adjust fonts, colours, and labels as needed
 
 ---
 
@@ -472,8 +499,8 @@ For publication-quality figures:
 - **[Life Cycle Analysis](06-0-life-cycle-analysis.md)** - Provides emissions data
 - **[Renewable Energy](03-renewable-energy.md)** - Provides solar generation data
 - **[Supply System Optimisation](07-supply-optimisation.md)** - Provides Pareto frontier data
-- **[Export Results to CSV](01-import-export.md#export-results-to-csv)** - Export data for custom plots
+- **[Export Results to .csv (Summary & Analytics)](01-import-export.md#export-results-to-csv-summary--analytics)** - Export data for custom plots
 
 ---
 
-[← Back: Utilities](09-utilities.md) | [Back to Index](index.md)
+[← Back: Utilities](09-utilities.md) | [Back to Index](index.md) | [Next: District Evolution Pathways →](11-district-pathways.md)

@@ -11,9 +11,8 @@ from sqlmodel import select
 from starlette.responses import FileResponse
 from starlette.background import BackgroundTask
 
+from cea.interfaces.dashboard.api.utils import CEAProject, CEAProjectID
 from cea.interfaces.dashboard.dependencies import (
-    CEAProjectID,
-    CEAProjectRoot,
     CEAUserID
 )
 from cea.interfaces.dashboard.lib.database.session import SessionDep as CEASession
@@ -29,14 +28,12 @@ from cea.interfaces.dashboard.server.downloads import (
     DownloadStartedEvent,
     OutputFileType
 )
-from cea.interfaces.dashboard.utils import secure_path
 
 router = APIRouter()
 
 
 class PrepareDownloadRequest(BaseModel):
     """Request model for preparing a download."""
-    project: str
     scenarios: List[str]
     input_files: bool = False
     output_files: List[OutputFileType] = []
@@ -86,7 +83,7 @@ class DownloadUrlResponse(BaseModel):
 @router.post("/prepare", response_model=DownloadResponse)
 async def prepare_download(
     request: PrepareDownloadRequest,
-    project_root: CEAProjectRoot,
+    project_path: CEAProject,
     user_id: CEAUserID,
     session: CEASession
 ):
@@ -99,7 +96,7 @@ async def prepare_download(
 
     Args:
         request: Download request parameters
-        project_root: Project root directory
+        project_path: Resolved project directory (from X-CEA-Project header)
         user_id: Current user ID
         session: Database session
 
@@ -122,22 +119,6 @@ async def prepare_download(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No files selected for download"
-        )
-
-    # Ensure project root
-    if project_root is None or project_root == "":
-        logger.error("Unable to determine project path")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Project root not defined",
-        )
-
-    project_path = secure_path(os.path.join(project_root, request.project), root=project_root)
-
-    if not os.path.exists(project_path):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project path does not exist"
         )
 
     # Get project id (verify ownership)
@@ -355,7 +336,7 @@ async def get_download_url(
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
     # Build URL
-    download_url = f"/api/downloads/{download_id}?token={token}"
+    download_url = f"/downloads/{download_id}?token={token}"
 
     logger.info(f"Generated download URL for {download_id}, expires in {expires_in}s")
 
@@ -370,29 +351,30 @@ async def get_download_url(
 async def download_file(
     download_id: str,
     session: CEASession,
-    user_id: Optional[str] = None,  # From CEAUserID dependency (cookies/session)
+    user_id: CEAUserID,
     token: Optional[str] = None  # From query parameter (pre-signed URL)
 ):
     """
     Download the prepared zip file.
     Supports two authentication methods:
-    1. Session-based (cookies) via user_id dependency
-    2. Token-based (pre-signed URL) via token query parameter
+    1. Session-based (cookies) via the CEAUserID dependency
+    2. Token-based (pre-signed URL) via the token query parameter
 
+    Token takes precedence when both are present.
     File is deleted immediately after download (single-use policy).
 
     Args:
         download_id: Download ID
         session: Database session
-        user_id: Current user ID from session (optional if using token)
-        token: JWT token from pre-signed URL (optional if using session)
+        user_id: Current user ID resolved from session cookies by CEAUserID
+        token: JWT token from pre-signed URL (optional)
 
     Returns:
         File response with zip file
 
     Raises:
         HTTPException 401: If no authentication provided
-        HTTPException 403: If token invalid or user not authorized
+        HTTPException 403: If token invalid or user not authorised
         HTTPException 404: If download not found
         HTTPException 409: If download already in progress
         HTTPException 410: If download already completed
@@ -561,8 +543,9 @@ async def delete_download(
     Returns:
         Success message
     """
+    # Lock row for update to prevent racing an in-flight download_file transfer
     result = await session.execute(
-        select(Download).where(Download.id == download_id)
+        select(Download).where(Download.id == download_id).with_for_update()
     )
     download = result.scalar_one_or_none()
 

@@ -18,9 +18,10 @@ This guide is designed for end users who want to learn how to use the CEA-4 App 
 New to CEA-4? Start with these resources:
 
 1. **Create New Scenario Wizard** - Use this in CEA-4 App to automate initial data setup
-2. **[Quick Reference Guide](00-quick-reference.md)** - A single-page overview of all 39 features
-3. **[Data Management](08-data-management.md)** - Understanding the automated data preparation
-4. **[Energy Demand Forecasting](04-demand-forecasting.md)** - Core functionality for building energy analysis
+2. **[Quick Reference Guide](00-quick-reference.md)** - A single-page overview of all 48 features
+3. **[Variable & File Glossary](../glossary/index.md)** - Reference of all 184 input/intermediate/output files, grouped by feature
+4. **[Data Management](08-data-management.md)** - Understanding the automated data preparation
+5. **[Energy Demand Forecasting](04-demand-forecasting.md)** - Core functionality for building energy analysis
 
 ## Feature Categories
 
@@ -30,7 +31,7 @@ The CEA-4 App organises its features into the following categories:
 Tools for exchanging data with external applications and generating summary reports.
 - Export to Rhino/Grasshopper
 - Import from Rhino/Grasshopper
-- Export Results to CSV
+- Export Results to .csv (Summary & Analytics)
 
 ### 2. [Solar Radiation Analysis](02-solar-radiation.md)
 Calculate solar radiation on building surfaces for renewable energy assessments.
@@ -53,19 +54,20 @@ Forecast hourly and annual energy demand for heating, cooling, electricity, and 
 
 ### 5. [Thermal Network Design](05-thermal-network.md)
 Design and analyse district heating and cooling networks.
-- Network Layout Generation
-- Thermal Hydraulic Flow & Sizing
+- Thermal Network Part 1: Layout
+- Thermal Network Part 2a: Flow & Sizing, Single-Phase
+- Thermal Network Part 2b: Flow & Sizing, Multiple-Phase — phased rollout over time
 
-### 6. [Life Cycle Analysis](06-0-life-cycle-analysis.md)
-Assess environmental impacts and costs of building energy systems using what-if supply scenarios.
-- [Final Energy](06-1-final-energy.md) - Carrier consumption by buildings and plants
-- [Emissions](06-2-emissions.md) - Lifecycle and operational GHG emissions
-- [System Costs](06-3-system-costs.md) - CAPEX and OPEX analysis
-- [Heat Rejection](06-4-heat-rejection.md) - Waste heat to environment
+### 6. [Life Cycle Analysis (LCA)](06-0-life-cycle-analysis.md)
+Assess environmental impacts and costs of building energy systems using what-if supply scenarios. All four features run on a shared what-if scenario; **LCA Part 1: Energy by Carrier must run first** and produces the `configuration.json` consumed by the other three.
+- [LCA Part 1: Energy by Carrier](06-1-final-energy.md) - Carrier consumption by buildings and plants; includes hourly SC/PVT-primary DHW tank dispatch
+- [LCA Part 2a: GHG Emissions](06-2-emissions.md) - Lifecycle and operational GHG emissions, with optional grid-decarbonisation trajectory
+- [LCA Part 2b: Costs](06-3-system-costs.md) - CAPEX, OPEX, and total annualised cost (TAC) at building, component, and plant level
+- [LCA Part 2c: Heat Rejection](06-4-heat-rejection.md) - Anthropogenic waste heat to the environment, with map-layer visualisation
 
 ### 7. [Energy Supply System Optimisation](07-supply-optimisation.md)
 Optimise energy supply systems for buildings and districts.
-- Building-Scale Supply System Optimisation *(CLI only)*
+- Supply System Optimisation: Building-Scale *(CLI only)*
 - District Supply System Optimisation
 
 ### 8. [Data Management](08-data-management.md)
@@ -81,15 +83,38 @@ Prepare and validate input data for CEA analysis.
 ### 9. [Utilities](09-utilities.md)
 Supporting tools for data conversion, format verification, and more.
 - CEA-4 Format Helper
-- Sensitivity Analysis Sampler
-- File Format Conversion Tools
-- Building Rename Tool
+- Generate Samples for Sensitivity Analysis (SA)
+- .dbf to .csv to .dbf
+- .shp to .csv to .shp
+- Rename Building
 
 ### 10. [Visualisation](10-visualisation.md)
 Create charts and plots to visualise CEA results.
-- Plot Building Energy Demand
-- Plot Solar Technology Results
-- Plot Building Comfort Chart
+Fifteen plots, covering demand, carriers, emissions, costs, solar, comfort and optimisation:
+- Plot - Building Energy Demand, Plot - Solar Technology, Plot - Building Comfort Chart
+- Plot - Energy by Carrier, Plot - Energy Flow Sankey, Plot - Load Duration Curve by Component
+- Plot - Lifecycle Emissions, Plot - Emission Timeline, Plot - Operational Emissions,
+  Plot - Pathway Emission Timeline
+- Plot - Cost Breakdown, Plot - System Cost Sankey
+- Plot - Anthropogenic Heat Rejection, Plot - Supply System, Plot - Pareto Front
+
+### 11. [District Evolution Pathways](11-district-pathways.md)
+Model how a district changes over time — construction, demolition and retrofit across a
+sequence of years — and run analyses on each year.
+- Create District Evolution Pathway
+- Create Building Events
+- Define and Apply Intervention Templates
+- Bake Pathway States
+- Simulate Pathway
+- Validate State / Validate All States
+- Clear State / Delete Pathway
+
+### 12. [Canvas Builder](12-canvas-builder.md)
+Side-by-side comparison workspace. Columns are scenarios, what-if variants or pathway years;
+cards (plots, KPIs, maps, notes) are drawn for every column at once.
+- Four comparison modes
+- KPI strips across nine domains
+- Y-axis alignment for fair comparison
 
 ## How to Use This Guide
 
@@ -131,8 +156,9 @@ A standard CEA-4 analysis typically follows this sequence:
 6. **Optimisation** (Optional)
    - Optimise building-scale or district-scale supply systems
 
-7. **Impact Assessment** (Life Cycle Analysis)
-   - Calculate emissions and system costs
+7. **Impact Assessment** (Life Cycle Analysis - LCA Parts 1, 2a, 2b, 2c)
+   - Run **LCA Part 1: Energy by Carrier** first (carrier consumption per what-if scenario)
+   - Then **LCA Part 2a: GHG Emissions**, **LCA Part 2b: Costs**, and **LCA Part 2c: Heat Rejection** for the same what-if
 
 8. **Results & Reporting** (Visualisation & Export)
    - Generate plots and charts
@@ -155,6 +181,5 @@ If you encounter issues:
 
 ---
 
-**Last Updated**: October 2025
-**CEA Version**: 4.0+
-**Guide Version**: 1.0
+**Last Updated**: September 2026
+**CEA Version**: 4.0.0-beta.8

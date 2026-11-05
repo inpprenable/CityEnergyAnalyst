@@ -1,0 +1,755 @@
+from __future__ import annotations
+
+import os
+import shutil
+import time
+from pathlib import Path
+from uuid import uuid4
+
+import geopandas as gpd
+import pandas as pd
+import pytest
+import yaml
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+from shapely.geometry import Polygon
+
+import cea.api
+import cea.config
+from cea.datamanagement.district_pathways.pathway_state import (
+    DistrictEvolutionPathway,
+    DistrictStateYear,
+)
+from cea.datamanagement.district_pathways.pathway_status import (
+    read_state_status,
+    record_baked_state,
+    record_custom_state,
+    record_simulated_state,
+)
+from cea.datamanagement.district_pathways.state_simulation.main import simulate_all_states
+from cea.inputlocator import InputLocator
+from cea.interfaces.dashboard.api.inputs import router as inputs_router
+from cea.interfaces.dashboard.api.pathways import router as pathways_router
+import cea.interfaces.dashboard.utils as dashboard_utils
+from cea.interfaces.dashboard.dependencies import CEALocalConfig, require_authenticated, get_cea_config
+from cea.interfaces.dashboard.settings import Settings, get_settings
+from cea.tests.paths import REPO_ROOT
+
+
+@pytest.fixture(autouse=True)
+def _no_temp_directory_cleanup(monkeypatch):
+    """Keep atexit from removing the temp directories these tests create.
+
+    Scoped to this module rather than assigned on the class at import time: a permanent
+    assignment leaks into every test that runs afterwards, silently turning real cleanup into
+    a no-op (`test_inputlocator_temp_directory` depends on it working).
+    """
+    monkeypatch.setattr(InputLocator, "_cleanup_temp_directory", lambda self: None)
+
+
+@pytest.fixture
+def pathway_api_fixture(monkeypatch):
+    # Force local mode with no enforced project_root, regardless of the
+    # developer's real .env.local (e.g. CEA_LOCAL=false, CEA_PROJECT_ROOT=...).
+    # secure_path() reads settings via a module-level get_settings() call
+    # rather than FastAPI DI, so the FastAPI dependency_overrides below don't
+    # reach it — it needs its own patch.
+    test_settings = Settings(local=True, project_root=None)
+    monkeypatch.setattr(dashboard_utils, "get_settings", lambda: test_settings)
+
+    project_root = REPO_ROOT / ".tmp-pathway-api" / uuid4().hex
+    project_root.mkdir(parents=True, exist_ok=True)
+
+    config = CEALocalConfig(cea.config.DEFAULT_CONFIG)
+    config.project = str(project_root)
+    config.scenario_name = "baseline"
+
+    scenario = Path(config.scenario)
+    locator = InputLocator(str(scenario))
+
+    _write_zone_shapefile(locator)
+    _write_minimal_pathway_databases(locator)
+    _write_demo_pathway(locator)
+    _write_demo_templates(locator)
+
+    app = FastAPI(dependencies=[Depends(require_authenticated)])
+    app.include_router(pathways_router, prefix="/pathways")
+    app.include_router(inputs_router, prefix="/inputs")
+    app.dependency_overrides[get_cea_config] = lambda: config
+    app.dependency_overrides[require_authenticated] = lambda: None
+    app.dependency_overrides[get_settings] = lambda: test_settings
+
+    yield {
+        "client": TestClient(app, headers={
+            "X-CEA-Project": str(project_root),
+            "X-CEA-Scenario-Name": config.scenario_name,
+        }),
+        "config": config,
+        "locator": locator,
+    }
+
+    shutil.rmtree(project_root, ignore_errors=True)
+
+
+def test_list_create_and_overview_pathways(pathway_api_fixture):
+    client = pathway_api_fixture["client"]
+
+    response = client.get("/pathways/")
+    assert response.status_code == 200
+    assert response.json() == {"pathways": ["demo"]}
+
+    overview = client.get("/pathways/overview")
+    assert overview.status_code == 200
+    payload = overview.json()
+    assert payload["span"] == {"start_year": 2020, "end_year": 2040}
+    assert payload["pathways"][0]["pathway_name"] == "demo"
+    assert payload["pathways"][0]["years"] == [2020, 2030, 2040]
+
+    create_response = client.post(
+        "/pathways/",
+        json={"pathway_name": "new-pathway"},
+    )
+    assert create_response.status_code == 200
+
+
+def test_pathway_routes_use_the_parent_while_a_state_is_inspected(pathway_api_fixture):
+    """Inspecting a state sends its X-CEA-Child-Scenario header with every request. The
+    state's folder has no pathways of its own, so pathway routes resolve to the parent --
+    otherwise the overview comes back empty and the GUI timeline disappears."""
+    client = pathway_api_fixture["client"]
+    _create_state_folder(pathway_api_fixture["locator"], "demo", 2030, ["B1"])
+    in_state = {"X-CEA-Child-Scenario": "demo/2030"}
+
+    assert client.get("/pathways/", headers=in_state).json() == {"pathways": ["demo"]}
+    overview = client.get("/pathways/overview", headers=in_state)
+    assert overview.status_code == 200
+    assert [p["pathway_name"] for p in overview.json()["pathways"]] == ["demo"]
+
+    # Also while inspecting a state whose folder is gone (e.g. its inputs were just cleared).
+    cleared = client.get("/pathways/overview", headers={"X-CEA-Child-Scenario": "demo/2040"})
+    assert cleared.status_code == 200
+    assert [p["pathway_name"] for p in cleared.json()["pathways"]] == ["demo"]
+
+
+def test_database_save_inside_a_state_marks_it_custom(pathway_api_fixture):
+    """Like an input save, a database save inside a state marks it custom, so bake keeps it
+    instead of rebuilding it from the parent's inputs."""
+    client = pathway_api_fixture["client"]
+    locator = pathway_api_fixture["locator"]
+    _create_state_folder(locator, "demo", 2030, ["B1"])
+    state_locator = InputLocator(locator.get_state_in_time_scenario_folder("demo", 2030))
+    for loc in (locator, state_locator):
+        if os.path.exists(loc.get_database_components_materials()):
+            os.remove(loc.get_database_components_materials())
+
+    seeded = client.post("/inputs/databases/components/materials", json={"source": "CH"},
+                         headers={"X-CEA-Child-Scenario": "demo/2030"})
+    assert seeded.status_code == 200
+    assert read_state_status(locator, pathway_name="demo", year=2030).get("custom") is True
+
+    # The same save on the parent scenario marks no state.
+    assert client.post("/inputs/databases/components/materials", json={"source": "CH"}).status_code == 200
+    assert not read_state_status(locator, pathway_name="demo", year=2020).get("custom")
+
+
+def test_custom_states_with_outputs_count_as_simulated(pathway_api_fixture):
+    """A custom (purple) state counts towards `all_simulated` -- which gates the Canvas
+    Builder's pathway picker -- and the emission timeline's pathways when it has outputs,
+    without a Simulate Pathway run: the user may have run the tools inside the state. Both
+    use `state_has_results`, which drops a custom state edited after its outputs were made."""
+    client = pathway_api_fixture["client"]
+    locator = pathway_api_fixture["locator"]
+    pathway = DistrictEvolutionPathway(pathway_api_fixture["config"], pathway_name="demo")
+    for year in (2020, 2030, 2040):
+        _create_state_folder(locator, "demo", year, ["B1"])
+        os.makedirs(InputLocator(locator.get_state_in_time_scenario_folder("demo", year)).get_output_folder(),
+                    exist_ok=True)
+        source_hash = pathway.source_log_hash_for_year(year)
+        record_baked_state(locator, pathway_name="demo", year=year, built_at="2026-02-01T00:00:00",
+                           source_log_hash=source_hash)
+        record_simulated_state(locator, pathway_name="demo", year=year, simulated_at="2026-02-10T00:00:00",
+                               source_log_hash=source_hash, workflow=[])
+
+    def all_simulated():
+        return client.get("/pathways/overview").json()["pathways"][0]["all_simulated"]
+
+    def emission_timeline_choices():
+        section = pathway_api_fixture["config"].sections["plots-pathway-emission-timeline"]
+        return section.parameters["existing-pathway-names"]._choices
+
+    assert all_simulated() is True
+    assert emission_timeline_choices() == ["demo"]
+
+    state_2030 = InputLocator(locator.get_state_in_time_scenario_folder("demo", 2030))
+    time.sleep(0.05)
+    record_custom_state(locator, pathway_name="demo", year=2030)  # edited after the outputs were made
+    assert all_simulated() is False
+    assert emission_timeline_choices() == []
+
+    later = time.time() + 10  # tools re-run inside the state: outputs now newer than the edit
+    os.utime(state_2030.get_output_folder(), (later, later))
+    assert all_simulated() is True
+    assert emission_timeline_choices() == ["demo"]
+
+    shutil.rmtree(state_2030.get_output_folder())  # nothing to show for that state
+    assert all_simulated() is False
+    assert emission_timeline_choices() == []
+
+
+def test_delete_pathway_route(pathway_api_fixture):
+    client = pathway_api_fixture["client"]
+    locator = pathway_api_fixture["locator"]
+
+    pathway_folder = Path(locator.get_district_pathway_folder("demo"))
+    assert pathway_folder.exists()
+
+    response = client.delete("/pathways/demo")
+    assert response.status_code == 200
+    assert response.json()["pathway_name"] == "demo"
+    assert not pathway_folder.exists()
+
+    missing_response = client.delete("/pathways/demo")
+    assert missing_response.status_code == 404
+
+    invalid_response = client.delete("/pathways/invalid*name")
+    assert invalid_response.status_code == 400
+
+
+def test_get_timeline_returns_required_years_without_manual_state_field(
+    pathway_api_fixture,
+):
+    client = pathway_api_fixture["client"]
+
+    response = client.get("/pathways/demo/timeline")
+    assert response.status_code == 200
+
+    payload = response.json()
+    assert payload["span"] == {"start_year": 2020, "end_year": 2040}
+    assert [row["year"] for row in payload["years"]] == [2020, 2030, 2040]
+
+    rows = {row["year"]: row for row in payload["years"]}
+    assert rows[2020]["state_kind"] == "stock"
+    assert "manual_state" not in rows[2020]
+    assert rows[2020]["status"]["bake"]["state"] == "not_baked"
+
+    assert rows[2030]["state_kind"] == "manual"
+    assert rows[2030]["can_delete"] is True
+    assert rows[2030]["yaml_preview"].startswith("created_at:")
+
+    assert rows[2040]["state_kind"] == "mixed"
+    assert rows[2040]["has_modifications"] is True
+    assert rows[2040]["status"]["bake"]["state"] == "not_baked"
+
+
+def test_post_year_rejects_empty_placeholder_for_stock_and_gap_years(pathway_api_fixture):
+    client = pathway_api_fixture["client"]
+    locator = pathway_api_fixture["locator"]
+
+    stock_response = client.post("/pathways/demo/years/2020")
+    assert stock_response.status_code == 409
+    assert stock_response.json()["detail"]["requires_edit"] is True
+
+    manual_response = client.post("/pathways/demo/years/2050")
+    assert manual_response.status_code == 409
+    assert manual_response.json()["detail"]["requires_edit"] is True
+
+    log_data = _read_log(locator, "demo")
+    assert 2050 not in log_data
+
+
+def test_building_events_endpoint_updates_yaml(pathway_api_fixture):
+    client = pathway_api_fixture["client"]
+    locator = pathway_api_fixture["locator"]
+
+    response = client.post(
+        "/pathways/demo/years/2035/building-events",
+        json={
+            "new_buildings": ["B2"],
+            "demolished_buildings": ["B1"],
+        },
+    )
+    assert response.status_code == 200
+
+    log_data = _read_log(locator, "demo")
+    assert log_data[2035]["building_events"] == {
+        "new_buildings": ["B2"],
+        "demolished_buildings": ["B1"],
+    }
+
+    timeline = client.get("/pathways/demo/timeline").json()
+    rows = {row["year"]: row for row in timeline["years"]}
+    assert rows[2035]["state_kind"] == "manual"
+
+
+def test_apply_templates_route_merges_modifications(pathway_api_fixture):
+    client = pathway_api_fixture["client"]
+    locator = pathway_api_fixture["locator"]
+
+    response = client.post(
+        "/pathways/demo/years/2020/apply-templates",
+        json={"template_names": ["upgrade-wall"]},
+    )
+    assert response.status_code == 200
+
+    log_data = _read_log(locator, "demo")
+    assert 2020 in log_data
+    assert "STANDARD1" in log_data[2020]["modifications"]
+
+    timeline = client.get("/pathways/demo/timeline").json()
+    rows = {row["year"]: row for row in timeline["years"]}
+    assert rows[2020]["state_kind"] == "mixed"
+
+
+def test_pathway_panel_jobs_run_via_cea_api(pathway_api_fixture):
+    config = pathway_api_fixture["config"]
+    locator = pathway_api_fixture["locator"]
+
+    cea.api.pathway_update_building_events(
+        scenario=config.scenario,
+        existing_pathway_names=["demo"],
+        year_of_state=2035,
+        buildings_to_construct=["B2"],
+        buildings_to_demolish=["B1"],
+    )
+    log_data = _read_log(locator, "demo")
+    assert log_data[2035]["building_events"] == {
+        "new_buildings": ["B2"],
+        "demolished_buildings": ["B1"],
+    }
+
+    cea.api.pathway_save_yaml(
+        scenario=config.scenario,
+        existing_pathway_names=["demo"],
+        year_of_state=2036,
+        raw_yaml="modifications: {}\n",
+    )
+    assert 2036 in _read_log(locator, "demo")
+
+    cea.api.pathway_delete_state(
+        scenario=config.scenario,
+        existing_pathway_names=["demo"],
+        year_of_state=2036,
+    )
+    assert 2036 not in _read_log(locator, "demo")
+
+
+def test_delete_pathway_job_via_cea_api(pathway_api_fixture):
+    config = pathway_api_fixture["config"]
+    locator = pathway_api_fixture["locator"]
+
+    pathway_folder = Path(locator.get_district_pathway_folder("demo"))
+    assert pathway_folder.exists()
+
+    cea.api.pathway_delete_pathway(
+        scenario=config.scenario,
+        existing_pathway_name="demo",
+    )
+
+    assert not pathway_folder.exists()
+
+
+def test_validate_all_states_job_via_cea_api(pathway_api_fixture):
+    config = pathway_api_fixture["config"]
+    locator = pathway_api_fixture["locator"]
+
+    _create_state_folder(locator, "demo", 2020, ["B1"])
+    _create_state_folder(locator, "demo", 2030, ["B1"])
+    _create_state_folder(locator, "demo", 2040, ["B1", "B2"])
+    _set_state_wall_thickness(locator, "demo", 2040, 0.15)
+
+    result = cea.api.pathway_validate_all_states(
+        scenario=config.scenario,
+        existing_pathway_name="demo",
+    )
+
+    assert result["pathway_name"] == "demo"
+    assert result["validated_years"] == [2020, 2030, 2040]
+    assert result["invalid_years"] == []
+    assert Path(locator.get_district_pathway_state_status_file("demo", 2040)).exists()
+
+
+def test_simulate_all_states_continues_after_one_year_fails(pathway_api_fixture, monkeypatch):
+    """A year whose workflow leaves no outputs/ behind must not discard the pathway log
+    updates already made for other years earlier in the same run: `simulate_all_states`
+    isolates each year's failure and still saves progress made before it (see
+    state_simulation/main.py)."""
+    config = pathway_api_fixture["config"]
+    locator = pathway_api_fixture["locator"]
+
+    _create_state_folder(locator, "demo", 2020, ["B1"])
+    _create_state_folder(locator, "demo", 2030, ["B1"])
+    _create_state_folder(locator, "demo", 2040, ["B1", "B2"])
+    _set_state_wall_thickness(locator, "demo", 2040, 0.15)
+
+    def fake_simulate(self, main_config, *, workflow, mark_simulated=True, recorded_workflow=None):
+        # The post-demand pass (recorded_workflow set) is the one responsible for producing
+        # outputs; skip it for year 2040 to simulate a workflow that completes without
+        # leaving results behind.
+        if recorded_workflow is not None and int(self.year) != 2040:
+            os.makedirs(InputLocator(self.state_folder()).get_output_folder(), exist_ok=True)
+
+    monkeypatch.setattr(DistrictStateYear, "simulate", fake_simulate)
+
+    with pytest.raises(ValueError, match="2040"):
+        simulate_all_states(config, pathway_name="demo")
+
+    log_data = _read_log(locator, "demo")
+    assert "latest_simulated_at" in log_data[2030]
+    assert "latest_simulated_at" not in log_data.get(2040, {})
+
+
+def test_put_year_yaml_saves_mapping(pathway_api_fixture):
+    client = pathway_api_fixture["client"]
+    locator = pathway_api_fixture["locator"]
+
+    raw_yaml = """
+building_events:
+  new_buildings:
+    - B2
+  demolished_buildings:
+    - B1
+modifications: {}
+"""
+    response = client.put(
+        "/pathways/demo/years/2031/yaml",
+        json={"raw_yaml": raw_yaml},
+    )
+    assert response.status_code == 200
+
+    log_data = _read_log(locator, "demo")
+    assert log_data[2031]["building_events"]["demolished_buildings"] == ["B1"]
+
+
+def test_validate_state_records_status_and_timeline_detects_log_drift(pathway_api_fixture):
+    """A validated + simulated state reports "validated"/"baked"/"simulated" in the
+    timeline; editing it afterwards drifts every phase to its "changed_after_*" state."""
+    client = pathway_api_fixture["client"]
+    config = pathway_api_fixture["config"]
+    locator = pathway_api_fixture["locator"]
+
+    _create_state_folder(locator, "demo", 2030, ["B1"])
+
+    pathway = DistrictEvolutionPathway(config, pathway_name="demo")
+    source_hash = pathway.source_log_hash_for_year(2030)
+    record_baked_state(
+        locator,
+        pathway_name="demo",
+        year=2030,
+        built_at="2026-02-01T00:00:00",
+        source_log_hash=source_hash,
+    )
+    # A simulated state has results on disk. collect_state_phase_status reports
+    # `not_simulated` without them, so the record alone is not enough to stand in for a run.
+    state_locator = InputLocator(locator.get_state_in_time_scenario_folder("demo", 2030))
+    os.makedirs(state_locator.get_output_folder(), exist_ok=True)
+    record_simulated_state(
+        locator,
+        pathway_name="demo",
+        year=2030,
+        simulated_at="2026-02-10T00:00:00",
+        source_log_hash=source_hash,
+        workflow=[],
+    )
+
+    validate_response = client.post("/pathways/demo/years/2030/validate-state")
+    assert validate_response.status_code == 200
+    assert validate_response.json()["is_valid"] is True
+
+    timeline = client.get("/pathways/demo/timeline").json()
+    row = {item["year"]: item for item in timeline["years"]}[2030]
+    assert row["status"]["validation"]["state"] == "validated"
+    assert row["status"]["bake"]["state"] == "baked"
+    assert row["status"]["simulation"]["state"] == "simulated"
+
+    edit_response = client.post(
+        "/pathways/demo/years/2030/apply-templates",
+        json={"template_names": ["upgrade-wall"]},
+    )
+    assert edit_response.status_code == 200
+
+    timeline_after_edit = client.get("/pathways/demo/timeline").json()
+    row_after_edit = {item["year"]: item for item in timeline_after_edit["years"]}[2030]
+    assert row_after_edit["status"]["validation"]["state"] == "changed_after_validation"
+    assert row_after_edit["status"]["bake"]["state"] == "changed_after_bake"
+    assert row_after_edit["status"]["simulation"]["state"] == "changed_after_simulation"
+
+
+def test_delete_manual_and_clear_mixed_state(pathway_api_fixture):
+    client = pathway_api_fixture["client"]
+    locator = pathway_api_fixture["locator"]
+
+    manual_delete = client.delete("/pathways/demo/years/2030")
+    assert manual_delete.status_code == 200
+    assert 2030 not in _read_log(locator, "demo")
+
+    mixed_clear = client.delete("/pathways/demo/years/2040")
+    assert mixed_clear.status_code == 200
+    log_data = _read_log(locator, "demo")
+    assert 2040 not in log_data
+
+
+def test_clear_state_outputs_only_keeps_inputs_and_log_entry(pathway_api_fixture):
+    """`delete_outputs=True, delete_inputs=False` removes only outputs/, leaving the baked
+    inputs and the pathway log entry in place so the state can be re-simulated."""
+    client = pathway_api_fixture["client"]
+    locator = pathway_api_fixture["locator"]
+
+    _create_state_folder(locator, "demo", 2030, ["B1"])
+    state_folder = Path(locator.get_state_in_time_scenario_folder("demo", 2030))
+    output_folder = Path(InputLocator(str(state_folder)).get_output_folder())
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    response = client.delete(
+        "/pathways/demo/years/2030",
+        params={"delete_inputs": False, "delete_outputs": True},
+    )
+    assert response.status_code == 200
+    assert not output_folder.exists()
+    # Inputs and the pathway entry are untouched, so the year stays baked and re-simulatable.
+    assert (state_folder / "inputs").is_dir()
+    assert 2030 in _read_log(locator, "demo")
+
+
+def test_clear_state_inputs_takes_the_whole_state_folder(pathway_api_fixture):
+    """Results cannot outlive the scenario that produced them.
+
+    Keeping outputs/ after the log entry is dropped leaves a state folder that
+    `check_district_pathway_log_yaml_integrity` rejects as unexpected, which blocks
+    Simulate Pathway for the whole pathway.
+    """
+    client = pathway_api_fixture["client"]
+    locator = pathway_api_fixture["locator"]
+
+    _create_state_folder(locator, "demo", 2030, ["B1"])
+    state_folder = Path(locator.get_state_in_time_scenario_folder("demo", 2030))
+    Path(InputLocator(str(state_folder)).get_output_folder()).mkdir(parents=True, exist_ok=True)
+
+    response = client.delete(
+        "/pathways/demo/years/2030",
+        params={"delete_inputs": True, "delete_outputs": False},
+    )
+    assert response.status_code == 200
+    assert not state_folder.exists()
+    assert 2030 not in _read_log(locator, "demo")
+
+
+def test_clear_state_on_a_stock_year_clears_the_bake_not_the_year(pathway_api_fixture):
+    """Clearing inputs on a stock-driven year removes its regenerable bake, not the year
+    itself: it is not in the log to begin with, and it stays in the timeline afterwards.
+    No 409 -- unlike POST/PUT create, DELETE does not special-case stock years."""
+    client = pathway_api_fixture["client"]
+    locator = pathway_api_fixture["locator"]
+
+    _create_state_folder(locator, "demo", 2020, ["B1"])
+    state_folder = Path(locator.get_state_in_time_scenario_folder("demo", 2020))
+    Path(InputLocator(str(state_folder)).get_output_folder()).mkdir(parents=True, exist_ok=True)
+
+    response = client.delete("/pathways/demo/years/2020")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["state_kind"] == "stock"
+    assert not state_folder.exists()
+    assert 2020 not in _read_log(locator, "demo")
+
+    timeline = client.get("/pathways/demo/timeline").json()
+    row = {item["year"]: item for item in timeline["years"]}[2020]
+    assert row["state_kind"] == "stock"
+
+
+def test_clear_state_requires_a_selection(pathway_api_fixture):
+    """Clearing with both delete_inputs and delete_outputs False is rejected as a 400,
+    not a silent no-op."""
+    client = pathway_api_fixture["client"]
+
+    response = client.delete(
+        "/pathways/demo/years/2030",
+        params={"delete_inputs": False, "delete_outputs": False},
+    )
+    assert response.status_code == 400
+
+
+def _write_zone_shapefile(locator: InputLocator) -> None:
+    zone_path = Path(locator.get_zone_geometry())
+    zone_path.parent.mkdir(parents=True, exist_ok=True)
+
+    gdf = gpd.GeoDataFrame(
+        {
+            "name": ["B1", "B2"],
+            "year": [2020, 2040],
+            "const_type": ["STANDARD1", "STANDARD1"],
+            "geometry": [
+                Polygon([(0, 0), (0, 1), (1, 1), (1, 0)]),
+                Polygon([(2, 0), (2, 1), (3, 1), (3, 0)]),
+            ],
+        },
+        crs="EPSG:4326",
+    )
+    gdf.to_file(zone_path)
+
+
+def _write_minimal_pathway_databases(locator: InputLocator) -> None:
+    construction_path = Path(locator.get_database_archetypes_construction_type())
+    construction_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "const_type": "STANDARD1",
+                "type_wall": "WALL_A",
+                "type_roof": "ROOF_A",
+                "type_base": "FLOOR_A",
+                "type_floor": "FLOOR_A",
+            }
+        ]
+    ).to_csv(construction_path, index=False)
+
+    wall_path = Path(locator.get_database_assemblies_envelope_wall())
+    roof_path = Path(locator.get_database_assemblies_envelope_roof())
+    floor_path = Path(locator.get_database_assemblies_envelope_floor())
+    wall_path.parent.mkdir(parents=True, exist_ok=True)
+
+    pd.DataFrame(
+        [
+            {
+                "code": "WALL_A",
+                "material_name_1": "brick",
+                "thickness_1_m": 0.20,
+                "material_name_2": "insulation",
+                "thickness_2_m": 0.10,
+                "material_name_3": "plaster",
+                "thickness_3_m": 0.02,
+                "Service_Life_wall": 50,
+            }
+        ]
+    ).to_csv(wall_path, index=False)
+
+    pd.DataFrame(
+        [
+            {
+                "code": "ROOF_A",
+                "material_name_1": "roofing",
+                "thickness_1_m": 0.12,
+                "material_name_2": "insulation",
+                "thickness_2_m": 0.10,
+                "material_name_3": "gypsum",
+                "thickness_3_m": 0.02,
+                "Service_Life_roof": 40,
+            }
+        ]
+    ).to_csv(roof_path, index=False)
+
+    pd.DataFrame(
+        [
+            {
+                "code": "FLOOR_A",
+                "material_name_1": "concrete",
+                "thickness_1_m": 0.20,
+                "material_name_2": "insulation",
+                "thickness_2_m": 0.05,
+                "material_name_3": "screed",
+                "thickness_3_m": 0.03,
+                "Service_Life_floor": 60,
+            }
+        ]
+    ).to_csv(floor_path, index=False)
+
+
+def _write_demo_pathway(locator: InputLocator) -> None:
+    pathway_folder = Path(locator.get_district_pathway_folder("demo"))
+    pathway_folder.mkdir(parents=True, exist_ok=True)
+
+    log_data = {
+        2030: {
+            "created_at": "2026-01-01T00:00:00",
+            "modifications": {},
+        },
+        2040: {
+            "created_at": "2026-01-01T00:00:00",
+            "latest_modified_at": "2026-01-10T00:00:00",
+            "modifications": {
+                "STANDARD1": {
+                    "wall": {
+                        "thickness_1_m": 0.15,
+                    }
+                }
+            },
+        },
+    }
+
+    with open(locator.get_district_pathway_log_file("demo"), "w", encoding="utf-8") as handle:
+        yaml.safe_dump(log_data, handle, sort_keys=False)
+
+
+def _write_demo_templates(locator: InputLocator) -> None:
+    templates = {
+        "upgrade-wall": {
+            "description": "Reduce wall layer thickness",
+            "modifications": {
+                "STANDARD1": {
+                    "wall": {
+                        "thickness_1_m": 0.15,
+                    }
+                }
+            },
+        }
+    }
+    # Intervention templates live at scenario level (one shared
+    # file across pathways) — per-pathway template files were
+    # removed when the workflow consolidated templates into
+    # ``scenario/outputs/pathways/intervention_templates.yml``.
+    with open(
+        locator.get_intervention_templates_file(),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        yaml.safe_dump(templates, handle, sort_keys=False)
+
+
+def _create_state_folder(
+    locator: InputLocator,
+    pathway_name: str,
+    year: int,
+    buildings: list[str],
+) -> None:
+    state_locator = InputLocator(
+        locator.get_state_in_time_scenario_folder(pathway_name, year)
+    )
+    shutil.copytree(
+        locator.get_input_folder(),
+        state_locator.get_input_folder(),
+        dirs_exist_ok=True,
+    )
+    zone = gpd.read_file(state_locator.get_zone_geometry())
+    zone = zone[zone["name"].isin(buildings)]
+    zone.to_file(state_locator.get_zone_geometry())
+
+
+def _set_state_wall_thickness(
+    locator: InputLocator,
+    pathway_name: str,
+    year: int,
+    thickness: float,
+) -> None:
+    state_locator = InputLocator(
+        locator.get_state_in_time_scenario_folder(pathway_name, year)
+    )
+    wall_path = Path(state_locator.get_database_assemblies_envelope_wall())
+    wall_df = pd.read_csv(wall_path)
+    wall_df.loc[wall_df["code"] == "WALL_A", "thickness_1_m"] = thickness
+    wall_df.to_csv(wall_path, index=False)
+
+
+def _read_log(locator: InputLocator, pathway_name: str) -> dict[int, dict]:
+    with open(locator.get_district_pathway_log_file(pathway_name), "r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    return {int(year): entry for year, entry in data.items()}
+
+
+def test_network_layout_step_keeps_previous_states_pipes():
+    from cea.datamanagement.district_pathways.state_simulation.workflow_assembly import (
+        build_network_layout_step,
+    )
+
+    step = build_network_layout_step(
+        year=2030, required_services=["DH"], previous_network_name="thermal_network_2025"
+    )
+    assert step["parameters"]["keep-existing-pipes"] is True

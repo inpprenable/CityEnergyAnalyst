@@ -1,0 +1,74 @@
+# Dashboard Job System
+
+## Architecture
+
+```
+Client → Server (jobs.py) → Worker (cea/worker.py) → Server
+         ↓                    ↓
+    Database (SQLModel)   CEA Scripts
+         ↓
+    SocketIO Events
+```
+
+- **Server**: Job lifecycle, database, SocketIO
+- **Worker**: Subprocess executing CEA scripts
+- **Communication**: Worker POSTs to server → server emits SocketIO to client
+
+## Job States
+
+`PENDING → STARTED → SUCCESS/ERROR/CANCELED/KILLED`
+
+**Soft Deletion**: Uses `deleted_at`/`deleted_by` fields (not state change) to preserve completion state.
+
+## Job Lifecycle
+
+**Creation** (`POST /jobs/new`): Creates `JobInfo` UUID+PENDING, handles file uploads to `/tmp/cea_job_{job_id}_*`.
+- **Scenario resolution**: `parameters["scenario"]` is server-resolved from `X-CEA-*` headers via `resolve_job_scenario()`/`script_takes_scenario_path()` (`api/utils.py`).
+- **Overriding client values**: a client-supplied `parameters["scenario"]` is never trusted — the server-resolved value always wins.
+- **Reserved name**: `scenario` is reserved across the *entire* config schema; `general:scenario` (a `ScenarioParameter`) is the only parameter anywhere allowed to be named `scenario` — enforced by `test_only_general_scenario_is_named_scenario` (`cea/tests/test_script_parameters.py`). If you need a config value with different semantics (e.g. the name of a scenario still to be created), name it something else, e.g. `new-scenario-name`.
+
+**Start** (`POST /jobs/start/{job_id}`): Auth-checked, row-locked. Spawns `python -m cea.worker {job_id} {server_url}`.
+
+**Worker steps**:
+1. Register signal handlers → fetch job → redirect stdout/stderr to `JobServerStream`
+2. `POST /jobs/started` → `cea.api.{script_name}(**parameters)` → `POST /jobs/success` or `/jobs/error`
+
+**Signal handling**: Worker uses `os._exit(0)` on `SIGTERM`/`SIGINT` — immediate exit, no cleanup needed (server already set state before signalling).
+
+**Stream capture**: `JobServerStream` queues output → daemon thread POSTs to server → server emits `cea-worker-message` via SocketIO.
+
+## State Transitions
+
+All transitions are auth-checked and row-locked (TOCTOU protection).
+
+| Endpoint | Sets state | Notes |
+|---|---|---|
+| `POST /jobs/started/{id}` | STARTED | Worker-initiated |
+| `POST /jobs/success/{id}` | SUCCESS | Graceful cleanup |
+| `POST /jobs/error/{id}` | ERROR | Graceful cleanup |
+| `POST /jobs/cancel/{id}` | CANCELED | User-initiated; must be PENDING or STARTED |
+| `kill_job()` | KILLED | Internal; force kill |
+| `DELETE /jobs/{id}` | *(soft delete)* | Sets `deleted_at`, preserves state; blocked if STARTED |
+
+**Cleanup**: Graceful = `terminate()` → wait → `kill()`. Force = immediate `kill()`. Temp files removed on all transitions.
+
+**Pitfalls**:
+- Commit DB **before** emitting SocketIO (emit outside try-except to prevent rollback)
+- Serialise SocketIO payloads with captured strings, not `job.model_dump()` on expired ORM state
+- Keep FastAPI responses as Python objects; JSON-safe conversion too early breaks computed fields like `duration`
+- Prefer FastAPI `status.HTTP_*` constants over numeric status codes in `HTTPException` and response constructors
+
+## Caching (`dependencies.py`)
+
+- `worker_processes`: `job_id → PID` (TTL-based)
+- `streams`: `job_id → List[str]` stdout/stderr chunks (TTL-based)
+
+## SocketIO Events (room: `user-{user_id}`)
+
+`cea-job-created`, `cea-worker-started`, `cea-worker-message`, `cea-worker-success`, `cea-worker-error`, `cea-worker-canceled`, `cea-worker-killed`, `cea-job-deleted`
+
+Retry: `emit_with_retry()` (3 retries, exponential backoff).
+
+## Docker
+
+Server runs as PID 1 with a `SIGCHLD` handler (`setup_sigchld_handler` in `app.py`) that reaps zombie workers via `os.waitpid(-1, WNOHANG)`. Tini not required but easy to re-enable.

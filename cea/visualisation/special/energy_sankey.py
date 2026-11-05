@@ -27,6 +27,13 @@ from cea.visualisation.format.plot_colours import (
     component_display,
     component_tech_colour,
 )
+from cea.visualisation.special.sankey_scale import NODE_PAD, scale_figures
+from cea.visualisation.special._error_html import (
+    has_analysis_config,
+    list_available_whatif_names,
+    warning_html,
+    whatif_mismatch_html,
+)
 
 __author__ = "Zhongming Shi"
 __copyright__ = "Copyright 2026, Architecture and Building Systems - ETH Zurich"
@@ -1171,7 +1178,7 @@ def create_sankey_fig(sankey_data, title, unit_label):
             label=sankey_data['node_labels'],
             color=sankey_data['node_colors'],
             x=sankey_data['node_x'],
-            pad=24,
+            pad=NODE_PAD,
             thickness=20,
             line=dict(color='rgba(0,0,0,0)', width=0),
         ),
@@ -1266,12 +1273,9 @@ def main(config: cea.config.Configuration):
 
     whatif_names = getattr(plot_config, 'what_if_name', [])
     if not whatif_names:
-        return (
-            '<div style="padding:20px;border:2px solid #ffcc00;border-radius:5px;'
-            'background:#fff8e1;">'
-            '<h3>No what-if scenario selected</h3>'
-            '<p>Please select a what-if scenario with final energy results.</p>'
-            '</div>'
+        return warning_html(
+            title='No what-if scenario selected',
+            body='Please select a what-if scenario with final energy results.',
         )
 
     service_filter = plot_config.y_service_category_to_plot
@@ -1281,73 +1285,67 @@ def main(config: cea.config.Configuration):
     custom_title = plot_config.plot_title
     use_solar_irradiation = getattr(plot_config, 'use_solar_irradiation', True)
 
-    # ── First pass: build all sankey_data, collect totals for proportional height ──
-    _BASE_HEIGHT = 600
-    _MIN_HEIGHT = 150
-    # slot: either ('ok', whatif_name, sankey_data) or ('err', html_str)
+    # slot: either ('ok', fig) or ('err', html_str)
     slots = []
+
+    scenario_name = os.path.basename(config.scenario)
+    available_whatifs = list_available_whatif_names(locator, has_analysis_config)
 
     for whatif_name in whatif_names:
         if locator.find_analysis_configuration_file(whatif_name) is None:
-            expected_path = locator.get_analysis_configuration_file(whatif_name)
-            slots.append(('err', (
-                f'<div style="padding:20px;border:2px solid #ff6b6b;border-radius:5px;'
-                f'background:#ffe0e0;margin:12px 0">'
-                f'<h3>Final energy data not found for <em>{whatif_name}</em></h3>'
-                f'<p>Run <strong>final-energy</strong> for this scenario first.</p>'
-                f'<code>{expected_path}</code>'
-                f'</div>'
+            slots.append(('err', whatif_mismatch_html(
+                scenario_name=scenario_name,
+                whatif_name=whatif_name,
+                label='Final energy',
+                tool=getattr(config, '_feature_label', 'the upstream tool'),
+                available=available_whatifs,
             )))
             continue
 
-        df = load_energy_flow_data(locator, whatif_name)
+        # The configuration.yml exists but the underlying data
+        # files may not (e.g. partial copies between scenarios).
+        # Catch missing-input errors and route through the same
+        # mismatch overlay rather than 500-ing the whole request.
+        try:
+            df = load_energy_flow_data(locator, whatif_name)
+        except (FileNotFoundError, OSError):
+            slots.append(('err', whatif_mismatch_html(
+                scenario_name=scenario_name,
+                whatif_name=whatif_name,
+                label='Final energy',
+                tool=getattr(config, '_feature_label', 'the upstream tool'),
+                available=available_whatifs,
+            )))
+            continue
         sankey_data = build_sankey_data(df, service_filter, unit_divisor, use_solar_irradiation)
         if sankey_data is None:
-            slots.append(('err', (
-                f'<div style="padding:20px;border:2px solid #ffcc00;border-radius:5px;'
-                f'background:#fff8e1;margin:12px 0">'
-                f'<h3>No energy flow data for <em>{whatif_name}</em></h3>'
-                f'<p>The selected service categories produced no non-zero values.</p>'
-                f'</div>'
+            slots.append(('err', warning_html(
+                title=f'No energy flow data for {whatif_name}',
+                body='The selected service categories produced no non-zero values.',
             )))
             continue
 
-        slots.append(('ok', whatif_name, sankey_data))
+        feature_label = custom_title or 'CEA-4 Energy Flow'
+        subtitle = ' | '.join([feature_label, scenario_name, whatif_name])
+        title = f"<b>Energy Flow ({unit_label})</b><br><sub>{subtitle}</sub>"
+        slots.append(('ok', create_sankey_fig(sankey_data, title, unit_label)))
 
-    global_total = max(
-        (sum(sd['value']) for kind, *rest in slots if kind == 'ok' for sd in [rest[1]]),
-        default=1.0,
-    )
+    # One scale for every figure, so equal energy draws at equal width.
+    scale_figures([slot[1] for slot in slots if slot[0] == 'ok'], unit_label)
 
-    # ── Second pass: render with proportional heights, preserve order ─────────
     html_outputs = []
     plotly_included = False
-    for slot in slots:
-        if slot[0] == 'err':
-            html_outputs.append(slot[1])
+    for kind, content in slots:
+        if kind == 'err':
+            html_outputs.append(content)
             continue
-        _, whatif_name, sankey_data = slot
-        scenario_total = sum(sankey_data['value'])
-        height = max(_MIN_HEIGHT, int(_BASE_HEIGHT * scenario_total / global_total))
-        scenario_name = os.path.basename(config.scenario)
-        feature_label = custom_title or 'CEA-4 Energy Flow'
-        subtitle_parts = [feature_label, scenario_name, whatif_name]
-        subtitle = ' | '.join(subtitle_parts)
-        title = f"<b>Energy Flow</b><br><sub>{subtitle}</sub>"
-        fig = create_sankey_fig(sankey_data, title, unit_label)
-        fig.update_layout(height=height, autosize=False)
         include_js = 'cdn' if not plotly_included else False
         plotly_included = True
-        html_outputs.append(fig.to_html(full_html=False, include_plotlyjs=include_js,
-                                        config={'responsive': True}))
+        html_outputs.append(content.to_html(full_html=False, include_plotlyjs=include_js,
+                                            config={'responsive': True}))
 
     if not html_outputs:
-        return (
-            '<div style="padding:20px;border:2px solid #ffcc00;border-radius:5px;'
-            'background:#fff8e1;">'
-            '<h3>No energy flow data to display</h3>'
-            '</div>'
-        )
+        return warning_html(title='No energy flow data to display')
 
     body = '\n'.join(html_outputs)
     return (

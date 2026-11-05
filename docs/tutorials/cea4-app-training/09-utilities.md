@@ -65,10 +65,28 @@ The report includes:
 - Suggested fixes
 - Line numbers for errors
 
+### What Migration Renames
+
+Migration is not only CEA-3 → CEA-4. It also brings older CEA-4 scenarios up to current naming,
+so these run silently when you migrate:
+
+| old | new | why it matters |
+|---|---|---|
+| `air_conditioning_systems.csv` | `hvac.csv` | without it the HVAC tab and the demand script report the file as missing |
+| `supply_systems.csv` | `supply.csv` | same |
+| `Hs_ag`, `Hs_bg` | `Hs`, `occupied_bg` | the heated-area share and the below-ground occupancy flag were split apart |
+
 ### Common Issues Detected
 
 **Missing Required Columns**:
 - Solution: Add missing columns with default values
+
+**A materials file using the old column names**:
+- `MATERIALS.csv` columns ending `_recycling` were renamed to `_disposal` (for example
+  `GHG_emission_recycling` → `GHG_emission_disposal`)
+- Verification points at the specific column rather than rewriting your file, because the two
+  are not always the same quantity — rename it yourself once you have checked the values mean
+  disposal (EN 15978 modules C2–C4)
 
 **Invalid Data Types**:
 - Solution: Check that numbers are not text, dates are formatted correctly
@@ -133,27 +151,24 @@ Generates parameter samples for sensitivity analysis using the Sobol method. Sen
 
 | Parameter | Description | Typical Value |
 |-----------|-------------|---------------|
-| **Number of samples** | Sample size | 512, 1024, or 2048 |
-| **Parameters to vary** | Which inputs to sample | User-defined |
-| **Sampling method** | Sobol or other | Sobol (recommended) |
+| **Create scenario directory** | Create a parallel scenario input folder for each sample | false |
+| **N** | Saltelli base sample size; generates N × (D + 2) samples for D variables | 32 |
+| **Having variable 1-5** | Enable each variable to sample | Variable 1 on |
+| **Variable 1-5 lower / upper bound** | Sampling range of each enabled variable | User-defined |
 
 ### How to Use
 
-1. **Define parameters to vary**:
-   - Create parameter configuration file
-   - Specify ranges or distributions for each parameter
-
-2. **Run sample generation**:
+1. **Run sample generation**:
    - Navigate to **Utilities**
-   - Select **Generate Samples for Sensitivity Analysis**
-   - Set number of samples (recommend 512 or 1024)
+   - Select **Generate Samples for Sensitivity Analysis (SA)**
+   - Enable up to five variables and set their lower/upper bounds
+   - Set **N** (total samples = N × (D + 2) for D variables)
+   - Optionally enable **Create scenario directory** to create one empty scenario folder per sample
    - Click **Run**
 
-3. **Output**: Scenario folders with parameter variations
-   - `scenario_SA_001/` - First sample
-   - `scenario_SA_002/` - Second sample
-   - ...
-   - `scenario_SA_N/` - Nth sample
+2. **Output**:
+   - `{project}/sampled_variables.csv` - One row of variable values per sample
+   - If **Create scenario directory** is enabled: `{project}/SA_1/`, `SA_2/`, ... with empty `inputs` folders to fill in per sample
 
 ### Next Steps After Sample Generation
 
@@ -170,18 +185,18 @@ Generates parameter samples for sensitivity analysis using the Sobol method. Sen
 
 ### Tips
 - **Start small**: Test with 64-128 samples before full run
-- **Computational cost**: N samples × analysis time
+- **Computational cost**: N × (D + 2) scenarios × analysis time per scenario
 - **Use batch processing**: Automate via CLI if needed
 - **High-performance computing**: Consider cluster for large SA
 
 ### Troubleshooting
 
 **Issue**: Too many scenario folders (disk space)
-- **Solution**: Reduce number of samples
+- **Solution**: Reduce N or disable a variable (the number of scenarios is N × (D + 2))
 - **Solution**: Use symbolic links for common files (advanced)
 
 **Issue**: Long computation time
-- **Solution**: Reduce sample size
+- **Solution**: Reduce N or the number of enabled variables
 - **Solution**: Use multiprocessing and batch workflow
 
 ---
@@ -192,7 +207,7 @@ Generates parameter samples for sensitivity analysis using the Sobol method. Sen
 
 ---
 
-## DBF to CSV to DBF
+## .dbf to .csv to .dbf
 
 ### Overview
 Converts files between .dbf (dBase format) and .csv/.xlsx formats for editing. DBF files are used by shapefiles to store attribute data; this tool allows editing in Excel or other spreadsheet programs.
@@ -223,7 +238,7 @@ Converts files between .dbf (dBase format) and .csv/.xlsx formats for editing. D
 #### Converting DBF to CSV
 
 1. Navigate to **Utilities**
-2. Select **DBF to CSV to DBF**
+2. Select **.dbf to .csv to .dbf**
 3. Choose mode: **DBF to CSV**
 4. Select input .dbf file
 5. Specify output .csv file path
@@ -266,7 +281,7 @@ When converting CSV → DBF:
 
 ---
 
-## SHP to CSV to SHP
+## .shp to .csv to .shp
 
 ### Overview
 Converts shapefiles (geometry + attributes) to CSV/XLSX and back. Similar to DBF conversion but handles geometry information, allowing viewing and editing of spatial data in spreadsheet format.
@@ -295,7 +310,7 @@ Converts shapefiles (geometry + attributes) to CSV/XLSX and back. Similar to DBF
 #### Converting SHP to CSV
 
 1. Navigate to **Utilities**
-2. Select **SHP to CSV to SHP**
+2. Select **.shp to .csv to .shp**
 3. Choose mode: **SHP to CSV**
 4. Select input .shp file
 5. Specify output .csv file path
@@ -345,7 +360,7 @@ Facilitates renaming a building across all scenario files. When you rename a bui
 ### When to Use
 - Standardizing building naming conventions
 - Fixing building ID errors
-- Reorganizing building identifiers
+- Reorganising building identifiers
 - After importing external data with different IDs
 
 ### How It Works

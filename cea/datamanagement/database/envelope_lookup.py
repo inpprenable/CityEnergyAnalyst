@@ -1,7 +1,8 @@
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 import pandas as pd
 
+from dataclasses import fields as dataclass_fields
 from cea.datamanagement.database.assemblies import Envelope
 
 if TYPE_CHECKING:
@@ -21,8 +22,8 @@ class EnvelopeLookup:
     _FLOAT_FIELDS = {
         "U",
         "GHG_kgCO2m2",
-        # "GHG_production_kgCO2m2", # needed in future for detailed LCA
-        # "GHG_recycling_kgCO2m2",
+        "GHG_production_kgCO2m2",
+        "GHG_demolition_kgCO2m2",
         "GHG_biogenic_kgCO2m2",
         "G_win",
         "e_win",
@@ -33,37 +34,50 @@ class EnvelopeLookup:
     }
 
     def __init__(self, envelope: Envelope):
-        self._dfs: dict[str, pd.DataFrame] = {
-            name: df
-            for name, df in {
-                "wall": envelope.wall,
-                "roof": envelope.roof,
-                "floor": envelope.floor,
-                "window": envelope.window,
-                "tightness": envelope.tightness,
-                "shading": envelope.shading,
-                "mass": envelope.mass,
-            }.items()
-            if df is not None
-        }
-        if not self._dfs:
-            raise ValueError("No envelope databases loaded.")
-
-        # Build code owner map; reject duplicates across ALL DBs and within a DB
+        self.envelope = envelope
+        # Build owner map directly from envelope attributes
         self._owner: dict[str, str] = {}
         dups: dict[str, list[str]] = {}
-        for db_name, df in self._dfs.items():
+        any_loaded = False
+        for f in dataclass_fields(Envelope):
+            name = f.name
+            df: pd.DataFrame | None = getattr(envelope, name)
+            if df is None:
+                continue
+            any_loaded = True
             if df.index.duplicated().any():
                 dup_in = sorted(set(df.index[df.index.duplicated()].astype(str)))
-                raise ValueError(f"Duplicate codes within DB '{db_name}': {dup_in}")
+                raise ValueError(f"Duplicate codes within DB '{name}': {dup_in}")
             for code in df.index.astype(str):
                 if code in self._owner:
-                    dups.setdefault(code, [self._owner[code]]).append(db_name)
+                    dups.setdefault(code, [self._owner[code]]).append(name)
                 else:
-                    self._owner[code] = db_name
+                    self._owner[code] = name
+        if not any_loaded:
+            raise ValueError("No envelope databases loaded.")
         if dups:
             details = "; ".join(f"{c}: {sorted(dbset)}" for c, dbset in dups.items())
             raise ValueError(f"Duplicate codes across DBs are not allowed: {details}")
+
+    # --- helpers -----------------------------------------------------------------
+    def _df_for(self, db_name: str) -> pd.DataFrame:
+        """Return the DataFrame for a given envelope DB name or raise if missing/None."""
+        if not hasattr(self.envelope, db_name):
+            raise ValueError(f"Envelope has no attribute '{db_name}'.")
+        df = getattr(self.envelope, db_name)
+        if df is None:
+            raise ValueError(f"Envelope DataFrame '{db_name}' is None (not loaded).")
+        return df
+
+    @property
+    def databases(self) -> list[str]:
+        """List of database names present (non-empty DataFrames)."""
+        out = []
+        for f in dataclass_fields(Envelope):
+            df = getattr(self.envelope, f.name)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                out.append(f.name)
+        return out
 
     @classmethod
     def from_locator(cls, locator: InputLocator) -> "EnvelopeLookup":
@@ -97,7 +111,7 @@ class EnvelopeLookup:
         if code not in self._owner:
             raise ValueError(f"Code '{code}' not found in any database.")
         db = self._owner[code]
-        df = self._dfs[db]
+        df = self._df_for(db)
 
         col = self._col(db, field)
         if col not in df.columns:
@@ -144,14 +158,15 @@ class EnvelopeLookup:
 
     def _col(self, db: str, field: str) -> str:
         # Common envelope fields (dynamic per-component suffix)
-        if field in {
+        ghg_fields = {
             "U",
             "GHG_kgCO2m2",
             "GHG_biogenic_kgCO2m2",
-            # "GHG_production_kgCO2m2", # needed in future for detailed LCA
-            # "GHG_recycling_kgCO2m2",
+            "GHG_production_kgCO2m2",
+            "GHG_demolition_kgCO2m2",
             "Service_Life",
-        }:
+        }
+        if field in ghg_fields:
             # Map explicitly per DB to avoid ambiguous suffix logic.
             if db not in self._SUFFIX:
                 raise ValueError(
@@ -165,15 +180,16 @@ class EnvelopeLookup:
                 return f"GHG_{suf}_kgCO2m2"
             if field == "GHG_biogenic_kgCO2m2":
                 return f"GHG_biogenic_{suf}_kgCO2m2"
-            # if field == "GHG_production_kgCO2m2": # needed in future for detailed LCA
-            #     return f"GHG_production_{suf}_kgCO2m2"
-            # if field == "GHG_recycling_kgCO2m2":
-            #     return f"GHG_recycling_{suf}_kgCO2m2"
+            if field == "GHG_production_kgCO2m2":
+                return f"GHG_production_{suf}_kgCO2m2"
+            if field == "GHG_demolition_kgCO2m2":
+                return f"GHG_demolition_{suf}_kgCO2m2"
             # Service_Life
             return f"Service_Life_{suf}"
 
         # Window-only extras
-        if field in {"G_win", "e_win", "F_F"}:
+        window_fields = {"G_win", "e_win", "F_F"}
+        if field in window_fields:
             if db != "window":
                 raise ValueError(
                     f"Field '{field}' only exists in 'window' DB; code is in '{db}'."
@@ -181,6 +197,7 @@ class EnvelopeLookup:
             return field
 
         # Other DBs
+        other_fields = {"n50", "rf_sh", "Cm_af"}
         if field == "n50":
             if db != "tightness":
                 raise ValueError("Field 'n50' only exists in 'tightness' DB.")
@@ -199,6 +216,71 @@ class EnvelopeLookup:
             return field
 
         raise KeyError(
-            f"Unsupported field '{field}'. Allowed: U, GHG_kgCO2m2, GHG_biogenic_kgCO2m2, Service_Life, "
-            "description, Reference, G_win, e_win, F_F, n50, rf_sh, Cm_af."
+            f"Unsupported field '{field}'. Allowed: {', '.join(ghg_fields)}, {', '.join(window_fields)}, {', '.join(other_fields)}"
         )
+
+    def set_item_value(self, code: str, field: str, value: int | float | str | None) -> None:
+        """Set value for (code, field). See `get_item_value` for supported fields."""
+        code = str(code)
+        if code not in self._owner:
+            raise ValueError(f"Code '{code}' not found in any database.")
+        db = self._owner[code]
+        df = self._df_for(db)
+
+        col = self._col(db, field)
+        if col not in df.columns:
+            raise KeyError(
+                f"Column '{col}' not found in '{db}' for code '{code}'. "
+                f"Available: {', '.join(map(str, df.columns))}"
+            )
+
+        df.at[code, col] = value
+
+def envelope_emission_intensities(
+    lookup: EnvelopeLookup, code: str
+) -> tuple[float, float, float]:
+    """Return (production, demolition, biogenic) in kgCO2e/m2 for an envelope code.
+
+    The production/demolition split is decided per row, not per file: one ENVELOPE_WALL.csv can
+    hold layered rows that derive a split alongside direct-property rows that do not, and
+    windows never have layers at all. Testing the row's *values* rather than whether the
+    column exists is what makes that work -- once any row derives a split the column exists
+    for every row, so a column-level test hands back NaN for the rest.
+
+    Without a split, `GHG_kgCO2m2` is the whole lifecycle: attributing it to production and
+    reporting no demolition keeps the total right and only the phase breakdown coarse.
+    """
+    # Optional like the split: the loader creates this column for wall/roof/floor when a
+    # database omits it, but not for windows, which are not derived from materials.
+    biogenic = _optional_field(lookup, code, "GHG_biogenic_kgCO2m2", default=0.0)
+
+    production = _optional_field(lookup, code, "GHG_production_kgCO2m2")
+    demolition = _optional_field(lookup, code, "GHG_demolition_kgCO2m2")
+    if production is not None and demolition is not None:
+        return production, demolition, biogenic
+
+    total = lookup.get_item_value(code, "GHG_kgCO2m2")
+    if total is None:
+        raise ValueError(
+            f"Envelope database has no GHG_kgCO2m2 for item {code}; cannot report emissions."
+        )
+    return float(total), 0.0, biogenic
+
+
+def _optional_field(
+    lookup: EnvelopeLookup, code: str, field: str, default: float | None = None
+) -> float | None:
+    """The field's value, or `default` when the column is absent or the row leaves it empty."""
+    try:
+        return _as_float(lookup.get_item_value(code, field), default=default)
+    except KeyError:
+        return default
+
+
+def _as_float(value: Any, default: float | None) -> float | None:
+    """Parse to float, treating None, unparseable values and NaN alike as absent."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return default if pd.isna(result) else result

@@ -4,6 +4,7 @@ Read and summarise CEA results over all scenarios in a project.
 """
 import itertools
 import os
+import tempfile
 import pandas as pd
 import numpy as np
 import cea.config
@@ -12,8 +13,10 @@ from datetime import datetime, UTC
 import cea.inputlocator
 import geopandas as gpd
 from cea.analysis.lca.emission_timeline import _MAPPING_DICT
+from cea.utilities import validate_path_within_root
 
 from cea.demand.building_properties.useful_areas import calc_useful_areas
+from cea.scripts import tool_ref
 
 
 __author__ = "Zhongming Shi, Reynold Mok, Justin McCarty"
@@ -1160,7 +1163,13 @@ def slice_hourly_results_for_custom_time_period(hour_start, hour_end, df):
 
 
 def exec_read_and_slice(hour_start, hour_end, locator, list_metrics, list_buildings, bool_analytics=False, network_name=''):
+    """Locate, read, and hour-slice the CEA result files for `list_metrics`, or (for the
+    `architecture` feature) compute per-building areas from zone geometry + architecture
+    instead of reading a time series.
 
+    :return: (list_list_useful_cea_results, list_appendix) -- per-source-file result
+        DataFrames and their matching appendix labels (e.g. network name).
+    """
     # map the CEA Feature for the selected metrics
     cea_feature = map_metrics_cea_features(list_metrics)
 
@@ -1196,6 +1205,11 @@ def exec_read_and_slice(hour_start, hour_end, locator, list_metrics, list_buildi
         else:
             raise KeyError(f"Zone geometry must have either 'Name' or 'name' column. Available columns: {zone_raw.columns.tolist()}")
         zone_df = zone_raw.set_index(name_col)
+        # Normalise to 'name' regardless of which casing the source used: calc_useful_areas
+        # merges index-to-index and inherits this name, and the reset_index() below turns it
+        # back into a column that filter_cea_results_by_buildings and the later merge both
+        # require to be lowercase 'name'.
+        zone_df.index.name = 'name'
 
         architecture_df = pd.read_csv(locator.get_building_architecture()).set_index('name')
 
@@ -2026,7 +2040,7 @@ def get_building_year_standard_main_use_type(locator):
     return df
 
 
-def filter_by_year_range(df_typology, integer_year_start=None, integer_year_end=None):
+def filter_by_year_range(df_typology, integer_year_start=None, integer_year_end=None, scenario_df=None):
     """
     Filters rows in the DataFrame based on a year range.
 
@@ -2057,12 +2071,18 @@ def filter_by_year_range(df_typology, integer_year_start=None, integer_year_end=
 
     # Check if the filtered DataFrame is empty
     if filtered_df.empty:
-        raise ValueError("No buildings meet the selected criteria for the specified year range.")
+        years = (df_typology if scenario_df is None else scenario_df)['construction_year']
+        raise ValueError(
+            f"No buildings meet the selected criteria for the specified year range: none were built between "
+            f"{integer_year_start} and {integer_year_end}. Buildings in this scenario were built between "
+            f"{years.min()} and {years.max()}. Note that 'filter-buildings-by-year-start' and "
+            f"'filter-buildings-by-year-end' filter buildings by their year of construction."
+        )
 
     return filtered_df
 
 
-def filter_by_standard(df_typology, list_standard):
+def filter_by_standard(df_typology, list_standard, scenario_df=None):
     """
     Filters rows in the DataFrame based on whether the 'standard' column matches any item in list_standard.
 
@@ -2082,12 +2102,17 @@ def filter_by_standard(df_typology, list_standard):
 
     # Check if the filtered DataFrame is empty
     if filtered_df.empty:
-        raise ValueError("No buildings meet the selected criteria for the specified standards.")
+        available = ', '.join(sorted(
+            (df_typology if scenario_df is None else scenario_df)['construction_type'].astype(str).unique()))
+        raise ValueError(
+            "No buildings meet the selected criteria for the specified standards. "
+            f"Construction types of the buildings in this scenario: {available}."
+        )
 
     return filtered_df
 
 
-def filter_by_main_use(df_typology, list_main_use_type):
+def filter_by_main_use(df_typology, list_main_use_type, scenario_df=None):
     """
     Filters rows in the DataFrame based on whether the 'main_use_type' column matches any item in list_main_use_type.
 
@@ -2109,7 +2134,12 @@ def filter_by_main_use(df_typology, list_main_use_type):
 
     # Check if the filtered DataFrame is empty
     if filtered_df.empty:
-        raise ValueError("No buildings meet the selected criteria for the specified main use types.")
+        available = ', '.join(sorted(
+            (df_typology if scenario_df is None else scenario_df)['main_use_type'].astype(str).unique()))
+        raise ValueError(
+            "No buildings meet the selected criteria for the specified main use types. "
+            f"Main use types of the buildings in this scenario: {available}."
+        )
 
     return filtered_df
 
@@ -2829,9 +2859,9 @@ def copy_costs_to_summary(locator, summary_folder, list_buildings, network_name=
 
         # Check if cost files exist
         if not os.path.exists(costs_buildings_src):
-            return False, "costs_buildings.csv not found. Please run 'system-costs' first."
+            return False, f"costs_buildings.csv not found. Please run {tool_ref('system-costs')} first."
         if not os.path.exists(costs_components_src):
-            return False, "costs_components.csv not found. Please run 'system-costs' first."
+            return False, f"costs_components.csv not found. Please run {tool_ref('system-costs')} first."
 
         # Read cost files
         df_costs_buildings = pd.read_csv(costs_buildings_src)
@@ -2868,26 +2898,117 @@ def copy_costs_to_summary(locator, summary_folder, list_buildings, network_name=
         return False, f"Error copying cost files: {str(e)}"
 
 
+def _selects_every_database_choice(database_csv_path, column, selected):
+    """Whether `selected` covers every `column` value of the archetype database at `database_csv_path`.
+
+    A blank multi-choice filter reaches here already expanded to every choice the database
+    offers (`MultiChoiceParameter.empty_means_all`), which is indistinguishable from the user
+    ticking all of them. Both mean "do not filter": applying the list with `isin()` instead
+    would drop every building whose value is missing from the database (e.g. a zone file
+    carrying `const_type` codes of a different database), which the user has no way to select.
+    """
+    try:
+        choices = pd.read_csv(database_csv_path, usecols=[column])[column].dropna().astype(str)
+    except (OSError, ValueError):
+        return False
+    # an empty database offers nothing to cover, so a selection is a real filter, not "everything"
+    return not choices.empty and set(choices).issubset({str(s) for s in selected})
+
+
 def filter_buildings(locator, list_buildings,
                      integer_year_start, integer_year_end, list_standard,
                      list_main_use_type, ratio_main_use_type):
-    df_buildings = get_building_year_standard_main_use_type(locator)
+    # no-match errors describe the whole scenario, not what earlier filters left of it
+    scenario_df = get_building_year_standard_main_use_type(locator)
+    df_buildings = scenario_df
     # Names: only filter if explicitly provided
     if list_buildings:
         df_buildings = filter_by_building_names(df_buildings, list_buildings)
     # Year range: always safe (defaults handled inside)
-    df_buildings = filter_by_year_range(df_buildings, integer_year_start, integer_year_end)
-    # Construction type: only if provided
-    if list_standard:
-        df_buildings = filter_by_standard(df_buildings, list_standard)
-    # Main use type: only if provided
-    if list_main_use_type:
-        df_buildings = filter_by_main_use(df_buildings, list_main_use_type)
+    df_buildings = filter_by_year_range(df_buildings, integer_year_start, integer_year_end, scenario_df)
+    # Construction type: only if provided, and only if it actually narrows the selection
+    if list_standard and not _selects_every_database_choice(
+            locator.get_database_archetypes_construction_type(), 'const_type', list_standard):
+        df_buildings = filter_by_standard(df_buildings, list_standard, scenario_df)
+    # Main use type: only if provided, and only if it actually narrows the selection
+    if list_main_use_type and not _selects_every_database_choice(
+            locator.get_database_archetypes_use_type(), 'use_type', list_main_use_type):
+        df_buildings = filter_by_main_use(df_buildings, list_main_use_type, scenario_df)
     # Main use ratio: only if provided (defaults to 0 if None/empty)
     if ratio_main_use_type is not None:
         df_buildings = filter_by_main_use_ratio(df_buildings, ratio_main_use_type)
     list_buildings_out = df_buildings['name'].to_list()
     return df_buildings, list_buildings_out
+
+
+def write_selected_buildings_file(locator, buildings_path, list_buildings,
+                                  integer_year_start, integer_year_end, list_standard,
+                                  list_main_use_type, ratio_main_use_type,
+                                  bool_use_acronym):
+    """Filter the zone's buildings, attach their architecture areas, and write the
+    selected-buildings CSV that plotting reads back as `df_architecture_data`.
+
+    It carries the GFA/Af/Aroof columns that y-normalisation divides by and the
+    construction_year / use-type columns that x-sorting and faceting key on, so every
+    path that produces plot input has to write it.
+
+    Filtering, the architecture merge, and saving the result are all a prerequisite for
+    what follows: `calc_ubem_analytics_normalised` and `plot_input_processor` both read
+    `buildings_path` back. Unlike the per-metric exports below, there is nothing to
+    continue with if any of these fail, so a write failure propagates instead of being
+    recorded and swallowed -- a previous run's file must never be left in place as if it
+    were current. The parent directory is created if missing, and the write is atomic
+    (temp file + replace) so a failure partway through never leaves a truncated CSV.
+
+    :return: the filtered building names.
+    """
+    df_buildings, list_buildings = filter_buildings(
+        locator, list_buildings,
+        integer_year_start, integer_year_end, list_standard,
+        list_main_use_type, ratio_main_use_type,
+    )
+
+    # Architecture metrics come from the zone geometry and architecture CSV rather than
+    # a time series, so the hour range and network name exec_read_and_slice takes for
+    # other features are not read here.
+    list_list_useful_cea_results, _ = exec_read_and_slice(
+        0, 0, locator, list_metrics_architecture, list_buildings,
+    )
+    list_list_useful_cea_results_buildings = filter_cea_results_by_buildings(
+        bool_use_acronym, list_list_useful_cea_results, list_buildings,
+    )
+    df_buildings = pd.merge(df_buildings, list_list_useful_cea_results_buildings[0][0],
+                            on='name', how='inner')
+
+    numeric_columns = df_buildings.select_dtypes(include=[np.number]).columns
+    df_buildings[numeric_columns] = df_buildings[numeric_columns].round(2)
+
+    # Resolve and contain buildings_path under the scenario before touching the
+    # filesystem: the export folder name it is built from is user-supplied, so this
+    # guards against it escaping the scenario via a traversal segment.
+    buildings_path = validate_path_within_root(buildings_path, locator.scenario)
+
+    os.makedirs(os.path.dirname(buildings_path), exist_ok=True)
+    # A fixed `.tmp` suffix collides under concurrent writers targeting the same
+    # buildings_path (e.g. multiple plot panels for one scenario, or two sessions on a
+    # multi-worker dashboard deployment): one call's write, or its except-branch cleanup,
+    # could clobber another's in-flight temp file. mkstemp guarantees a unique path per
+    # call, so concurrent writers never share one.
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(buildings_path),
+        prefix=f"{os.path.basename(buildings_path)}.",
+        suffix=".tmp",
+    )
+    os.close(tmp_fd)
+    try:
+        df_buildings.to_csv(tmp_path, index=False, float_format="%.2f")
+        os.replace(tmp_path, buildings_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+    return list_buildings
 
 
 def replace_hyphens_with_underscores(string_list):
@@ -3300,32 +3421,18 @@ def process_building_summary(config, locator,
         summary_folder = locator.get_export_plots_folder()
     os.makedirs(summary_folder, exist_ok=True)
 
-    # Step 3: Get & Filter Buildings
-    df_buildings, list_buildings = filter_buildings(locator, list_buildings,
-                             integer_year_start, integer_year_end, list_standard,
-                             list_main_use_type, ratio_main_use_type)
-
-    # Step 4: Get Building GFA & Merge with df_buildings
-    list_list_useful_cea_results, list_appendix = exec_read_and_slice(hour_start, hour_end, locator, list_metrics_architecture, list_buildings, network_name=network_name)
-    list_list_useful_cea_results_buildings = filter_cea_results_by_buildings(bool_use_acronym, list_list_useful_cea_results, list_buildings)
-    df_buildings = pd.merge(df_buildings, list_list_useful_cea_results_buildings[0][0], on='name', how='inner')
-
-    # Step 5: Save Building Summary to Disk
-    try:
-        # Round all numeric columns to 2 decimal places
-        numeric_columns = df_buildings.select_dtypes(include=[np.number]).columns
-        df_buildings[numeric_columns] = df_buildings[numeric_columns].round(2)
-
-        if not plot:
-            buildings_path = locator.get_export_results_summary_selected_building_file(summary_folder)
-        else:
-            buildings_path = locator.get_export_plots_selected_building_file()
-        df_buildings.to_csv(buildings_path, index=False, float_format="%.2f")
-    except Exception as e:
-        error_msg = f"Step 5 (Save Building Summary): {str(e)}"
-        errors_encountered.append(error_msg)
-        print(f"Warning: {error_msg}")
-        print("         Continuing with remaining steps...")
+    # Steps 3-5: Filter buildings, attach architecture areas, save to disk. All of this is
+    # a prerequisite for every step below and for the readers of buildings_path, so there
+    # is nothing to continue with if any of it fails (see write_selected_buildings_file).
+    if not plot:
+        buildings_path = locator.get_export_results_summary_selected_building_file(summary_folder)
+    else:
+        buildings_path = locator.get_export_plots_selected_building_file()
+    list_buildings = write_selected_buildings_file(
+        locator, buildings_path, list_buildings,
+        integer_year_start, integer_year_end, list_standard,
+        list_main_use_type, ratio_main_use_type, bool_use_acronym,
+    )
 
     # Step 6: Export Results Without Date (Non-8760 Hours, Aggregate by Building)
     for list_metrics in list_list_metrics_without_date:

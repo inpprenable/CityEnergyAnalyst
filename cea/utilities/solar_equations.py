@@ -638,7 +638,9 @@ def calc_surface_azimuth(xdir, ydir, B):
     surface_azimuth = np.where((xdir < 0) & (ydir >= 0), 360 + teta_z, surface_azimuth)  # (xdir,ydir) = (-,+)
     surface_azimuth = np.where((xdir >= 0) & (ydir < 0), 180 + teta_z, surface_azimuth)  # (xdir,ydir) = (+,-)
 
-    if np.size(surface_azimuth) == 1:
+    # only scalar inputs give a scalar back: a one-element array (a surface with a single sensor)
+    # stays an array, and `float()` rejects it anyway
+    if np.ndim(surface_azimuth) == 0:
         return float(surface_azimuth)
     return surface_azimuth  # degree
 
@@ -714,7 +716,7 @@ def calc_groups(radiation_of_sensors_clean, sensors_metadata_cat):
     sensors_metadata_cat['type_orientation'] = sensors_metadata_cat['TYPE'] + '_' + sensors_metadata_cat['orientation']
     sensors_metadata_cat['surface'] = sensors_metadata_cat.index
     # group the sensors by categories
-    sensor_groups_ob = sensors_metadata_cat.groupby(['CATB', 'CATGB', 'CATteta_z', 'type_orientation'], observed=False)
+    sensor_groups_ob = sensors_metadata_cat.groupby(['CATB', 'CATGB', 'CATteta_z', 'type_orientation'], observed=True)
     group_keys = sensor_groups_ob.groups.keys()
     number_groups = len(group_keys)
 

@@ -2,7 +2,7 @@
 
 This category evaluates the potential for renewable energy generation from various sources including solar (PV, PVT, solar thermal), geothermal, water bodies, and sewage heat recovery.
 
-**💡 Customising Technology Databases**: All renewable energy technologies reference CEA databases for performance characteristics. You can customise these databases to test specific manufacturers' products or future technologies. Look for database files in `{scenario}/inputs/technology/components/CONVERSION/` and edit the relevant CSV files.
+**💡 Customising Technology Databases**: All renewable energy technologies reference CEA databases for performance characteristics. You can customise these databases to test specific manufacturers' products or future technologies. Look for database files in `{scenario}/inputs/database/COMPONENTS/CONVERSION/` and edit the relevant CSV files.
 
 ---
 
@@ -65,12 +65,12 @@ Calculates electricity generation potential from photovoltaic solar panels insta
 ### Output Files
 For each building `BXXX`:
 
-**PV results**: `{scenario}/outputs/data/potentials/solar/BXXX_PV.csv`
+**PV results**: `{scenario}/outputs/data/potentials/solar/PV/BXXX_{panel_type}.csv`
 - Hourly electricity generation (kWh)
 - 8,760 hours of generation data
 - Total annual generation
 
-**PV metadata**: `{scenario}/outputs/data/potentials/solar/BXXX_PV_sensors.csv`
+**PV metadata**: `{scenario}/outputs/data/potentials/solar/sensors/BXXX_PV_sensors.csv`
 - Panel locations and orientations
 - Installed capacity per surface (kWp)
 - Annual radiation per panel array
@@ -92,7 +92,7 @@ Typical values (Central Europe):
 ### Panel Types in CEA Database
 
 The CEA database includes various PV panel technologies with different efficiencies and performance characteristics. To see available panel types and their properties:
-1. Navigate to `{scenario}/inputs/technology/components/CONVERSION/PHOTOVOLTAIC_PANELS.csv`
+1. Navigate to `{scenario}/inputs/database/COMPONENTS/CONVERSION/PHOTOVOLTAIC_PANELS.csv`
 2. Review panel specifications (efficiency, temperature coefficients, etc.)
 
 **Customising the Database**:
@@ -149,7 +149,7 @@ Same as PV: solar radiation analysis must be completed
 - **Panel database**: Uses PVT-specific panel properties
 
 **PVT Panel Database**:
-- Navigate to `{scenario}/inputs/technology/components/CONVERSION/PHOTOVOLTAIC_THERMAL_PANELS.csv`
+- Navigate to `{scenario}/inputs/database/COMPONENTS/CONVERSION/PHOTOVOLTAIC_THERMAL_PANELS.csv`
 - You can customise by adding new PVT panel types with specific electrical and thermal performance characteristics
 - Reference custom panels in the "Type of PV panel" and "Type of SC panel" parameters
 
@@ -160,7 +160,7 @@ Similar to PV, plus:
 |-----------|-------------|---------------|
 | **Type of PV panel** | PV component technology | PV1 |
 | **Type of SC panel** | Solar thermal component | SC1 (flat plate) |
-| **Inlet temperature (PVT)** | Fluid inlet temp for heat extraction | 35-60°C |
+| **Inlet temperature (PVT)** | Fluid inlet temperature for heat extraction. Leave blank for the default | Blank (35°C) |
 
 ### How to Use
 
@@ -178,7 +178,7 @@ Similar to PV, plus:
 ### Output Files
 For each building `BXXX`:
 
-**PVT results**: `{scenario}/outputs/data/potentials/solar/BXXX_PVT.csv`
+**PVT results**: `{scenario}/outputs/data/potentials/solar/PVT/BXXX_{pv_panel}_{sc_panel}.csv`
 - Hourly electricity generation (kWh_el)
 - Hourly heat generation (kWh_th)
 - Panel temperatures
@@ -224,7 +224,7 @@ Solar radiation analysis must be completed
 | Parameter | Description | Typical Value |
 |-----------|-------------|---------------|
 | **Type of SC panel** | Collector technology | SC1 (flat plate) or SC2 (evacuated tube) |
-| **Inlet temperature (SC)** | Fluid inlet temperature | 40-70°C |
+| **Inlet temperature (SC)** | Fluid inlet temperature. Leave blank for the default | Blank (60°C flat plate, 75°C evacuated tube) |
 | **Panel on roof** | Install on roofs | Yes |
 | **Panel on wall** | Install on facades | Rarely |
 | **Radiation threshold** | Minimum radiation | 800 kWh/m²/yr |
@@ -233,7 +233,7 @@ Solar radiation analysis must be completed
 ### Collector Types
 
 The CEA database includes various solar thermal collector technologies. To see available collector types:
-1. Navigate to `{scenario}/inputs/technology/components/CONVERSION/SOLAR_COLLECTORS.csv`
+1. Navigate to `{scenario}/inputs/database/COMPONENTS/CONVERSION/SOLAR_COLLECTORS.csv`
 2. Review collector specifications (efficiency curves, optical properties, etc.)
 
 **Customising the Database**:
@@ -265,8 +265,8 @@ Common solar collector categories in the database:
    - Navigate to **Renewable Energy Potential Assessment**
    - Select **Solar Collectors (SC)**
    - Choose collector type (SC1 or SC2)
-   - Set inlet temperature based on application:
-     - DHW systems: 40-50°C
+   - Optionally set **Inlet temperature (SC)**. Leaving it blank uses the collector default (60°C for flat plate, 75°C for evacuated tube). Enter a value only to override that default for a lower- or higher-temperature design:
+     - Low-temperature DHW systems: 40-50°C
      - Space heating: 30-40°C
      - High-temp applications: 60-80°C
    - Set coverage (recommend 30-50% to leave room for PV)
@@ -348,15 +348,15 @@ The feature estimates:
 
 ### Prerequisites
 - Zone geometry
-- Scenario-level configuration (no building-specific inputs needed)
+- Building selection is optional; leave **Buildings available** blank to use all buildings
 
 ### Key Parameters
 
 | Parameter | Description | Typical Value |
 |-----------|-------------|---------------|
-| **Borehole depth** | Maximum depth of probes | 50 m (shallow) |
-| **Borehole spacing** | Minimum distance between probes | 5-6 m |
-| **Soil thermal conductivity** | Ground thermal properties | Auto (from terrain) or manual |
+| **Buildings available** | Buildings whose footprint can be used for probes | Blank (all buildings) |
+| **Extra area available** | Additional area outside building footprints where probes can be installed (m²) | 0 |
+| **Average probe depth** | Average depth of the geothermal probes (m) | 10 |
 
 ### How to Use
 
@@ -367,7 +367,7 @@ The feature estimates:
 
 ### Output Files
 
-**Geothermal potential**: `{scenario}/outputs/data/potentials/geothermal_potential.csv`
+**Geothermal potential**: `{scenario}/outputs/data/potentials/Shallow_geothermal_potential.csv`
 - Available ground area per building
 - Number of possible boreholes
 - Heat extraction capacity (kW)
@@ -425,25 +425,22 @@ Estimates sustainable heat extraction based on:
 
 | Parameter | Description | Typical Value |
 |-----------|-------------|---------------|
-| **Water body type** | Lake, river, or reservoir | User-defined |
-| **Distance to site** | Piping distance | Site-specific |
-| **Minimum water temp** | Environmental constraint | 4°C (to prevent freezing) |
+| **Max water volume withdrawal** | Maximum water volume that can be withdrawn (m³/h) | 1000 |
+| **Max delta temperature withdrawal** | Maximum temperature change allowed in the withdrawn water (°C) | 8 |
+| **Temperature max** | Maximum water temperature over the year at the extraction point (°C) | 6 |
+| **Temperature min** | Minimum water temperature over the year at the extraction point (°C) | 4 |
 
 ### How to Use
 
-1. **Define water body**:
-   - Provide water body polygon or coordinates
-   - Specify water body properties
-
-2. **Run analysis**:
+1. **Run analysis**:
    - Navigate to **Renewable Energy Potential Assessment**
    - Select **Water Body Potential**
-   - Configure parameters
+   - Set the withdrawal limits and water temperatures for your water body
    - Click **Run**
 
 ### Output Files
 
-**Water body potential**: `{scenario}/outputs/data/potentials/water_body_potential.csv`
+**Water body potential**: `{scenario}/outputs/data/potentials/Water_body_potential.csv`
 - Available heat extraction capacity (kW)
 - Seasonal variation
 - Distance penalties
@@ -485,8 +482,8 @@ Calculates heat recovery potential from wastewater (sewage) using heat exchanger
 Estimates heat recovery based on:
 - Building water demand (from demand calculations)
 - Wastewater temperatures
-- Heat exchanger efficiency
-- Flow rates and timing
+- Heat exchanger length available in the sewer
+- Flow rates and timing, including wastewater from neighbouring districts
 
 ### Prerequisites
 - **Energy demand analysis** must be completed (to determine water usage)
@@ -496,9 +493,9 @@ Estimates heat recovery based on:
 
 | Parameter | Description | Typical Value |
 |-----------|-------------|---------------|
-| **Heat exchanger efficiency** | Recovery efficiency | 40-60% |
-| **Minimum sewage temp** | After heat extraction | 10°C |
-| **Building water demand** | From demand calculation | Auto |
+| **Heat exchanger length** | Length of sewer pipeline available for the heat exchanger (m, at least 100) | 120 |
+| **Sewage water ratio** | Ratio of sewage flow to water consumption, accounting for solids and intakes | 0.95 |
+| **Sewage water district** | Wastewater from neighbouring districts passing through the heat exchanger (litres) | 50 |
 
 ### How to Use
 
@@ -512,7 +509,7 @@ Estimates heat recovery based on:
 
 ### Output Files
 
-**Sewage potential**: `{scenario}/outputs/data/potentials/sewage_potential.csv`
+**Sewage potential**: `{scenario}/outputs/data/potentials/Sewage_heat_potential.csv`
 - Recoverable heat per building (kWh/yr)
 - Peak recovery capacity (kW)
 - Monthly variation
@@ -575,8 +572,8 @@ Annual recoverable heat (rule of thumb):
    - Geothermal (if ground access)
    - Water body (if nearby)
    - Sewage (if high water use)
-3. **Compare results** using [Export Results to CSV](01-import-export.md#export-results-to-csv-summary--analytics)
-4. **Visualise** using [Plot - Solar Technology](10-visualisation.md#plot-solar-technology)
+3. **Compare results** using [Export Results to .csv (Summary & Analytics)](01-import-export.md#export-results-to-csv-summary--analytics)
+4. **Visualise** using [Plot - Solar Technology](10-visualisation.md#plot---solar-technology)
 5. **Integrate into supply system optimisation**
 
 ---

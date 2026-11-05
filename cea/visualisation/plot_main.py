@@ -15,6 +15,7 @@ import cea.inputlocator
 from cea.visualisation.c_plotter import generate_fig
 from cea.visualisation.a_data_loader import plot_input_processor
 from cea.visualisation.b_data_processor import calc_x_y_metric
+from cea.visualisation.special._error_html import generic_error_html
 
 __author__ = "Zhongming Shi"
 __copyright__ = "Copyright 2025, Architecture and Building Systems - ETH Zurich"
@@ -24,6 +25,10 @@ __version__ = "0.1"
 __maintainer__ = "Reynold Mok"
 __email__ = "cea@arch.ethz.ch"
 __status__ = "Production"
+
+
+SHARED_PLOT_SECTIONS = {"plots-general", "plots-building-filter", "plots-include-plants-buildings"}
+SOLAR_PLOT_FEATURES = ('pv', 'pvt', 'sc')
 
 
 def get_plot_cea_feature(config: cea.config.Configuration) -> str:
@@ -44,8 +49,8 @@ def get_plot_cea_feature(config: cea.config.Configuration) -> str:
                            "e.g. {\"feature\": \"demand\"}")
 
     sections = {p.split(":")[0] for p in config.restricted_to if p.startswith("plots-")}
-    # Ignore the plots-general section
-    sections.discard("plots-general")
+    # Ignore the sections shared by every plot script; only the feature's own section identifies it
+    sections -= SHARED_PLOT_SECTIONS
     if len(sections) != 1:
         raise CEAException("Unable to determine feature to plot. "
                            "Ensure that only one type of plot config is provided in scripts.yml in the correct format. "
@@ -67,7 +72,7 @@ def plot_all(config: cea.config.Configuration, scenario: str, plot_dict: dict, h
 
     print(f"Using context: {plot_dict}")
     
-    if plot_cea_feature in ('pv', 'pvt', 'sc'):
+    if plot_cea_feature in SOLAR_PLOT_FEATURES:
         solar_panel_types_dict = plot_dict.get('solar_panel_types', {})
 
         plot_cea_feature_umbrella = 'solar'
@@ -158,18 +163,30 @@ def plot_all(config: cea.config.Configuration, scenario: str, plot_dict: dict, h
 def main(config: cea.config.Configuration):
     scenario = config.scenario
     context: dict[str, Any] = config.plots_general.context
-    # When running via CLI, the script identity is known — override any stale feature in context
+    # When the script identity is known, it decides the feature: `context` is saved state shared by
+    # every plot script (and sent by the client), so its feature may be left over from another plot.
     plot_cea_feature = None
     try:
         plot_cea_feature = get_plot_cea_feature(config)
-        context = {**context, 'feature': plot_cea_feature}
     except CEAException:
         plot_cea_feature = context.get('feature')  # Fall back to feature stored in context
+    else:
+        if plot_cea_feature == 'solar':
+            # plot-solar covers three features; which one (and its panel type) only the context knows
+            plot_cea_feature = context.get('feature')
+            if plot_cea_feature not in SOLAR_PLOT_FEATURES:
+                raise CEAException(
+                    "Unable to determine which solar technology to plot. Select a solar technology "
+                    "(PV, PVT or SC) and panel type, e.g. using the context parameter "
+                    "{\"feature\": \"pv\", \"solar_panel_types\": {\"pv\": \"PV1\"}}. "
+                    f"Got: {context}")
+        else:
+            context = {**context, 'feature': plot_cea_feature}
 
     # Determine config section umbrella (solar features all share 'plots-solar')
     whatif_names = []
     if plot_cea_feature:
-        umbrella = 'solar' if plot_cea_feature in ('pv', 'pvt', 'sc') else plot_cea_feature
+        umbrella = 'solar' if plot_cea_feature in SOLAR_PLOT_FEATURES else plot_cea_feature
         try:
             _section = config.sections[f'plots-{umbrella}']
             whatif_names = list(getattr(_section, 'what_if_name', []) or [])
@@ -195,13 +212,12 @@ def main(config: cea.config.Configuration):
             fig = plot_all(config, scenario, context, hide_title=False,
                            whatif_names_override=[whatif_name])
             slots.append(('ok', whatif_name, fig))
-        except Exception as e:
-            slots.append(('err', whatif_name, (
-                f'<div style="padding:20px;border:2px solid #ff6b6b;border-radius:5px;'
-                f'background:#ffe0e0;margin:12px 0">'
-                f'<h3>Error plotting <em>{whatif_name}</em></h3>'
-                f'<code>{e}</code></div>'
-            )))
+        except Exception:
+            slots.append((
+                'err',
+                whatif_name,
+                generic_error_html(title=f'Error plotting {whatif_name}'),
+            ))
 
     # Compute global y-range from all successful figures when user has not set explicit bounds
     plot_config_general = config.plots_general

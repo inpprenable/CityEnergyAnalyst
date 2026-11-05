@@ -31,13 +31,18 @@ from cea.constants import (HEAT_CAPACITY_OF_WATER_JPERKGK, P_WATER_KGPERM3, HOUR
                            THERMAL_NETWORK_TEMPERATURE_CONVERGENCE_K)
 from cea.constants import PUR_lambda_WmK, STEEL_lambda_WmK, SOIL_lambda_WmK, KELVIN_CONVERSION
 from cea.optimization.constants import PUMP_ETA
-from cea.technologies.thermal_network.common.geometry import extract_network_from_shapefile, load_network_shapefiles
+from cea.technologies.thermal_network.common.geometry import (
+    extract_network_from_shapefile,
+    load_network_shapefiles,
+    remove_idle_branches,
+)
 from cea.technologies.thermal_network.common.utils import add_date_to_dataframe, calculate_ground_temperature
 from cea.technologies.constants import NETWORK_DEPTH, REDUCED_TIME_STEPS, MAX_INITIAL_DIAMETER_ITERATIONS, \
     MAX_NODE_FLOW
 from cea.utilities.standardize_coordinates import get_lat_lon_projected_shapefile, get_projected_coordinate_system
 from cea.technologies.heat_exchangers import get_heat_exchanger_by_description
 from cea.technologies.network_layout.plant_node_operations import PlantServices
+from cea.scripts import tool_ref
 
 __author__ = "Martin Mosteiro Romero, Shanshan Hsieh, Lennart Rogenhofer"
 __copyright__ = "Copyright 2016, Architecture and Building Systems - ETH Zurich"
@@ -424,6 +429,10 @@ class ThermalNetwork(object):
         # filter_edges=True because layout.shp contains edges for all network types (DC+DH combined),
         # but nodes are network-specific, so we filter to only edges that match this network's nodes
         node_df, edge_df = extract_network_from_shapefile(network_edges_df, network_nodes_df, filter_edges=True)
+        node_df, edge_df, idle_pipes = remove_idle_branches(node_df, edge_df)
+        if idle_pipes:
+            print(f"  Skipping {len(idle_pipes)} idle pipe(s) that serve no building (kept in the layout): "
+                  f"{', '.join(idle_pipes[:10])}" + (" ..." if len(idle_pipes) > 10 else ""))
 
         # create node catalogue indicating which nodes are plants and which consumers
 
@@ -448,7 +457,7 @@ class ThermalNetwork(object):
                     print(f"  Warning: Plant node type '{plant_type}' contains a legacy service suffix.")
                     print("    This suffix is no longer used to control network temperature.")
                     print("    Temperature strategy is now set via thermal-network:dh-temperature-mode.")
-                    print("    Re-run 'network-layout' to update plant node types to plain PLANT.")
+                    print(f"    Re-run {tool_ref('network-layout')} to update plant node types to plain PLANT.")
 
             # Always use dh-temperature-mode config to determine service order
             if self.dh_temperature_mode == 'high-temperature':
@@ -503,9 +512,9 @@ class ThermalNetwork(object):
                     if len(j) > 1:  # valid if e.g. if more than one flow and all flows incoming. Only need to flip one.
                         j = random.choice(j)
                     edge_node_df[edge_node_df.columns[j]] = -edge_node_df[edge_node_df.columns[j]]
-                    new_nodes = [edge_df['end node'][j], edge_df['start node'][j]]
-                    edge_df['start node'][j] = new_nodes[0]
-                    edge_df['end node'][j] = new_nodes[1]
+                    new_nodes = [edge_df['end node'].iloc[j], edge_df['start node'].iloc[j]]
+                    edge_df.iloc[j, edge_df.columns.get_loc('start node')] = new_nodes[0]
+                    edge_df.iloc[j, edge_df.columns.get_loc('end node')] = new_nodes[1]
                     changed[i] = True
                 else:
                     changed[i] = False
@@ -795,7 +804,8 @@ def thermal_network_main(locator, thermal_network, processes=1):
             # To do this, the initial dataset is repeated 4 times, the remaining values are filled with the average values of all above.
             edge_mass_flow_for_csv = pd.concat([edge_mass_flow_for_csv] * 4, ignore_index=True)
             while len(edge_mass_flow_for_csv.index) < HOURS_IN_YEAR:
-                edge_mass_flow_for_csv = edge_mass_flow_for_csv.append(edge_mass_flow_for_csv.mean(), ignore_index=True)
+                edge_mass_flow_for_csv = pd.concat(
+                    [edge_mass_flow_for_csv, edge_mass_flow_for_csv.mean().to_frame().T], ignore_index=True)
             edge_mass_flow_for_csv.to_csv(
                 thermal_network.locator.get_nominal_edge_mass_flow_csv_file(thermal_network.network_type,
                                                                             thermal_network.network_name), index=False)
@@ -862,7 +872,7 @@ def thermal_network_main(locator, thermal_network, processes=1):
             max_demand = abs(max(csv_outputs['plant_heat_requirement'], key=abs))
         # add plant heat demand to node.csv file
         ID = np.where(all_nodes_df_output['name'] == 'NODE' + str(plant_index))[0][0]
-        all_nodes_df_output['Q_hex_plant_kW'][ID] = max_demand
+        all_nodes_df_output.iloc[ID, all_nodes_df_output.columns.get_loc('Q_hex_plant_kW')] = max_demand
     # Output substation HEX node data
     all_nodes_df_output.to_csv(
         thermal_network.locator.get_thermal_network_node_types_csv_file(thermal_network.network_type,
@@ -1306,7 +1316,8 @@ def extrapolate_datapoints_for_representative_weeks(representative_week_data):
     representative_week_df = pd.DataFrame(representative_week_data)
     representative_week_df = pd.concat([representative_week_df] * 4, ignore_index=True)
     while len(representative_week_df.index) < HOURS_IN_YEAR:
-        representative_week_df = representative_week_df.append(representative_week_df.mean(), ignore_index=True)
+        representative_week_df = pd.concat(
+            [representative_week_df, representative_week_df.mean().to_frame().T], ignore_index=True)
     return representative_week_df
 
 
@@ -2396,12 +2407,12 @@ def initial_diameter_guess(thermal_network):
 
                 if required_flow_rate_df.abs().max(axis=1)[0] > 0:  # non 0 demand
                     # solve mass flow rates on edges
-                    thermal_network_reduced.edge_mass_flow_df[:][t:t + 1] = [
+                    thermal_network_reduced.edge_mass_flow_df.iloc[t:t + 1] = [
                         calc_mass_flow_edges(thermal_network_reduced.edge_node_df.copy(), required_flow_rate_df,
                                              thermal_network_reduced.all_nodes_df,
                                              diameter_guess, thermal_network_reduced.edge_df['length_m'].values,
                                              T_edge_initial_K, thermal_network_reduced.find_loops)]
-                    thermal_network_reduced.node_mass_flow_df[:][t:t + 1] = required_flow_rate_df.values
+                    thermal_network_reduced.node_mass_flow_df.iloc[t:t + 1] = required_flow_rate_df.values
 
                 iteration, \
                 min_edge_flow_flag = edge_mass_flow_iteration(thermal_network_reduced,

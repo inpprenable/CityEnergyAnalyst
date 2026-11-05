@@ -1,9 +1,11 @@
+import asyncio
 import os
 import sys
 
 import uvicorn
 
 from cea.config import Configuration
+from cea.interfaces.dashboard.bootstrap import initialize_dashboard
 from cea.interfaces.dashboard.lib.logs import logger
 from cea.interfaces.dashboard.settings import get_settings, Settings
 
@@ -35,10 +37,23 @@ def main(config: Configuration):
     # Load settings from env vars (priority) then config file
     settings = get_settings()
     load_from_config(settings, config)
-    logger.info(f"Using settings: {settings}")
+
+    # Set logger to DEBUG if dev mode is enabled, otherwise INFO
+    if config.server.dev:
+        settings.log_level = "DEBUG"
+
+    logger.info(
+        "Starting dashboard: host=%s port=%s workers=%s local=%s",
+        settings.host,
+        settings.port,
+        settings.workers or 1,
+        settings.local,
+    )
+    logger.debug(f"Using settings: {settings}")
 
     try:
         settings.to_env_vars()
+        asyncio.run(initialize_dashboard())
 
         uvicorn.run("cea.interfaces.dashboard.app:app",
                     reload=config.server.dev,

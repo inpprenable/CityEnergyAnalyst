@@ -10,7 +10,7 @@ from typing import Dict, Any, Optional, List, Union
 import geopandas
 import pandas as pd
 import sqlalchemy.exc
-from fastapi import APIRouter, UploadFile, Form, HTTPException, status, Request, Path, Depends
+from fastapi import APIRouter, UploadFile, Form, HTTPException, Query, status, Path, Depends
 from fastapi.concurrency import run_in_threadpool
 from geopandas import GeoDataFrame
 from osgeo import gdal
@@ -21,17 +21,19 @@ from typing_extensions import Annotated
 
 import cea.config
 import cea.inputlocator
+from cea.datamanagement.utils import VOID_HEIGHT_COLUMN
 from cea.datamanagement.databases_verification import verify_input_geometry_zone, verify_input_geometry_surroundings, \
-    verify_input_typology, COLUMNS_ZONE_TYPOLOGY, COLUMNS_ZONE_GEOMETRY, verify_input_terrain
+    verify_input_typology, COLUMNS_ZONE_TYPOLOGY, COLUMNS_ZONE_GEOMETRY, \
+    OPTIONAL_COLUMNS_ZONE_GEOMETRY, verify_input_terrain
 from cea.datamanagement.surroundings_helper import generate_empty_surroundings
-from cea.interfaces.dashboard.dependencies import CEAConfig, CEADatabaseConfig, CEAProjectRoot, CEAProjectInfo, \
+from cea.interfaces.dashboard.dependencies import CEAConfig, CEAProjectRoot, CEAProjectInfo, \
     create_project, CEAUserID, \
-    CEASeverDemoAuthCheck, CEAServerLimits
+    CEAServerLimits
 from cea.interfaces.dashboard.lib.database.session import SessionDep
 from cea.interfaces.dashboard.lib.logs import getCEAServerLogger
 from cea.interfaces.dashboard.settings import get_settings
-from cea.interfaces.dashboard.utils import secure_path, OutsideProjectRootError
-from cea.interfaces.dashboard.api.utils import validate_scenario_name
+from cea.interfaces.dashboard.utils import secure_path, secure_join_under_root, OutsideProjectRootError
+from cea.interfaces.dashboard.api.utils import CEAScenario, CEAProject, validate_scenario_name
 from cea.utilities.dbf import dbf_to_dataframe
 from cea.utilities.standardize_coordinates import get_geographic_coordinate_system, raster_to_WSG_and_UTM
 
@@ -48,13 +50,6 @@ GENERATE_TERRAIN_CEA = 'generate-terrain-cea'
 GENERATE_STREET_CEA = 'generate-street-cea'
 EMTPY_GEOMETRY = 'none'
 
-class ProjectPath(BaseModel):
-    project: str
-
-class ScenarioPath(BaseModel):
-    project: str
-    scenario_name: str
-
 class NewProject(BaseModel):
     project_name: str
     project_root: Optional[str] = None
@@ -62,7 +57,6 @@ class NewProject(BaseModel):
 
 
 class CreateScenario(BaseModel):
-    project: str
     scenario_name: str
     database: Union[str, UploadFile]
     user_zone: Union[str, UploadFile]
@@ -227,38 +221,15 @@ async def config_project_info(project_info: CEAProjectInfo) -> ConfigProjectInfo
 
 
 @router.get('/')
-async def get_project_info(project_root: CEAProjectRoot, project: str) -> ProjectInfo:
-    project_path = project
-    if project_root is not None and not project_path.startswith(project_root):
-        project_path = os.path.join(project_root, project_path)
-
-    try:
-        cea_project = secure_path(project_path)
-    except OutsideProjectRootError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        )
-
-    if not os.path.exists(cea_project):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f'Project: "{project}" does not exist',
-        )
-
-    config = cea.config.Configuration(cea.config.DEFAULT_CONFIG)
-    config.project = cea_project
-
-    project_info = {
-        'name': os.path.basename(config.project),
-        'project': config.project,
-        'scenarios_list': cea.config.get_scenarios_list(config.project)
-    }
-
-    return ProjectInfo(**project_info)
+async def get_project_info(project: CEAProject) -> ProjectInfo:
+    return ProjectInfo(
+        name=os.path.basename(project),
+        project=project,
+        scenarios_list=cea.config.get_scenarios_list(project),
+    )
 
 
-@router.post('/', dependencies=[CEASeverDemoAuthCheck])
+@router.post('/')
 async def create_new_project(project_root: CEAProjectRoot, new_project: NewProject,
                              user_id: CEAUserID, session: SessionDep, limit_settings: CEAServerLimits):
     """
@@ -296,6 +267,14 @@ async def create_new_project(project_root: CEAProjectRoot, new_project: NewProje
         try:
             # Add project to database
             await create_project(project, user_id, session)
+        except sqlalchemy.exc.IntegrityError as e:
+            # Project uri already exists (e.g. concurrent request created it first) -- leave
+            # the folder in place since another request may still be using it
+            logger.error(e)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Project already exists",
+            )
         except sqlalchemy.exc.SQLAlchemyError as e:
             # Remove folder if failed to create in database
             logger.error(e)
@@ -314,58 +293,60 @@ async def create_new_project(project_root: CEAProjectRoot, new_project: NewProje
     return {'message': 'Project folder created', 'project': project}
 
 
+class UpdateProjectScenario(BaseModel):
+    scenario_name: str
+
+
 @router.put('/')
-async def update_project(project_root: CEAProjectRoot, config: CEAConfig, scenario_path: ScenarioPath):
+async def update_project(config: CEAConfig, project: CEAProject, body: UpdateProjectScenario):
     """
-    Update Project info in config
+    Update Project info in config.
+
+    In local mode, persists the selection to ~/cea.config (keeps CLI parity).
+    In non-local (stateless) mode, save() is a no-op so only validation occurs.
     """
-    project_path = scenario_path.project
-    if project_root is not None and not project_path.startswith(project_root):
-        project_path = os.path.join(project_root, project_path)
+    scenario_name = validate_scenario_name(body.scenario_name)
 
-    project = secure_path(project_path)
-    scenario_name = validate_scenario_name(scenario_path.scenario_name)
+    config.project = project
+    config.scenario_name = scenario_name
+    config.save()
 
-    if project and scenario_name:
-        # Project path must exist but scenario does not have to
-        if os.path.exists(project):
-            config.project = project
-            config.scenario_name = scenario_name
-            if isinstance(config, CEADatabaseConfig):
-                await config.save()
-            else:
-                config.save()
-
-            return {'message': 'Updated project info in config', 'project': project, 'scenario_name': scenario_name}
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f'project: "{project}" does not exist',
-            )
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f'Parameters not valid - project: {project}, scenario_name: {scenario_name}',
-        )
+    return {'message': 'Updated project info in config', 'project': project, 'scenario_name': scenario_name}
 
 
-# TODO: Rename this endpoint once the old one is removed
-# Temporary endpoint to prevent breaking existing frontend
-@router.post('/scenario/v2', dependencies=[CEASeverDemoAuthCheck])
-async def create_new_scenario_v2(project_root: CEAProjectRoot, scenario_form: Annotated[CreateScenario, Form()],
-                                 limit_settings: CEAServerLimits):
-    project_path = scenario_form.project
-    if project_root is not None and not project_path.startswith(project_root):
-        project_path = os.path.join(project_root, project_path)
-
+@router.get('/state-folder')
+async def get_state_folder(
+    scenario: CEAScenario,
+    pathway_name: str = Query(...),
+    year: int = Query(...),
+):
+    """Return the path to a pathway state folder without mutating server state."""
+    from cea.datamanagement.district_pathways.pathway_state import validate_pathway_name
     try:
-        cea_project = secure_path(project_path)
-    except OutsideProjectRootError as e:
+        pathway_name = validate_pathway_name(pathway_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    locator = cea.inputlocator.InputLocator(scenario)
+    state_folder = locator.get_state_in_time_scenario_folder(pathway_name, year)
+
+    if not os.path.isdir(state_folder):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"State folder not found for pathway '{pathway_name}' year {year}.",
         )
-    
+
+    return {
+        'scenario_path': state_folder,
+        'parent_scenario': scenario,
+        'pathway_name': pathway_name,
+        'year': year,
+    }
+
+
+@router.post('/scenario')
+async def create_new_scenario(cea_project: CEAProject, scenario_form: Annotated[CreateScenario, Form()],
+                                 limit_settings: CEAServerLimits):
     settings = get_settings()
     if not settings.local:
         num_scenarios = len(cea.config.get_scenarios_list(cea_project))
@@ -415,7 +396,8 @@ async def create_new_scenario_v2(project_root: CEAProjectRoot, scenario_form: An
 
             # Make sure zone column names are in correct case
             zone_df.columns = [col.lower() for col in zone_df.columns]
-            rename_dict = {col.lower(): col for col in COLUMNS_ZONE_GEOMETRY}
+            rename_dict = {col.lower(): col
+                           for col in COLUMNS_ZONE_GEOMETRY + OPTIONAL_COLUMNS_ZONE_GEOMETRY}
             zone_df.rename(columns=rename_dict, inplace=True)
 
             verify_input_geometry_zone(zone_df)
@@ -425,7 +407,16 @@ async def create_new_scenario_v2(project_root: CEAProjectRoot, scenario_form: An
 
             zone_path = locator.get_zone_geometry()
             locator.ensure_parent_folder_exists(zone_path)
-            zone_df[COLUMNS_ZONE_GEOMETRY + ['geometry']].to_file(zone_path)
+            # Give every new scenario a void-deck column so it can be edited later. An upload
+            # carrying `void_deck` keeps it -- converting would rewrite the user's data -- and
+            # one carrying neither gets `height_vd = 0`, meaning "enclosed to the ground".
+            if not any(c in zone_df.columns for c in OPTIONAL_COLUMNS_ZONE_GEOMETRY):
+                zone_df[VOID_HEIGHT_COLUMN] = 0.0
+
+            # Keep any optional columns the upload carried; selecting a fixed list would
+            # silently strip them from the user's data on write.
+            optional = [c for c in OPTIONAL_COLUMNS_ZONE_GEOMETRY if c in zone_df.columns]
+            zone_df[COLUMNS_ZONE_GEOMETRY + optional + ['geometry']].to_file(zone_path)
 
         return zone_df
 
@@ -600,6 +591,11 @@ async def create_new_scenario_v2(project_root: CEAProjectRoot, scenario_form: An
             from cea.datamanagement.archetypes_mapper import main as archetypes_mapper
             archetypes_mapper(config)
 
+            # The scenario has just been mapped, so it starts locked: CEA owns the
+            # archetype-derived tables until the user chooses to take them over.
+            from cea.datamanagement import archetype_lock
+            archetype_lock.write_lock(locator, locked=True)
+
             # Move temp scenario to correct path
             print(f"Moving from {config.scenario} to {new_scenario_path}")
             shutil.move(config.scenario, new_scenario_path)
@@ -613,7 +609,7 @@ async def create_new_scenario_v2(project_root: CEAProjectRoot, scenario_form: An
 
     return {
         'message': 'Scenario created successfully',
-        'project': scenario_form.project,
+        'project': cea_project,
         'scenario_name': scenario_name
     }
 
@@ -624,25 +620,13 @@ def glob_shapefile_auxilaries(shapefile_path):
     return glob.glob('{basepath}.*'.format(basepath=os.path.splitext(shapefile_path)[0]))
 
 
-# TODO: Check if this is able to get user ID from request
-async def check_scenario_exists(request: Request, scenario: str = Path()):
-    try:
-        data = await request.json()
-        project = secure_path(data.get("project"))
-    except Exception as e:
-        print(e)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Could not determine project and scenario",
-        )
-
+async def check_scenario_exists(project: CEAProject, scenario: str = Path()):
     choices = cea.config.get_scenarios_list(project)
     if scenario not in choices:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='Scenario does not exist.',
         )
-    
 
 
 # FIXME: Potential Issue. Need to check if the scenario being deleted/renamed is running in scripts.
@@ -653,11 +637,11 @@ async def get(scenario: str):
 
 
 @router.put('/scenario/{scenario}', dependencies=[Depends(check_scenario_exists)])
-async def put(config: CEAConfig, scenario: str, payload: Dict[str, Any]):
+async def put(config: CEAConfig, project: CEAProject, scenario: str, payload: Dict[str, Any]):
     """Update scenario"""
-    scenario_path = secure_path(os.path.join(config.project, scenario))
+    scenario_path = secure_path(os.path.join(project, scenario))
     new_scenario_name = payload.get('name')
-    
+
     # Assume no operations done, return None
     if new_scenario_name is None:
         return None
@@ -665,14 +649,11 @@ async def put(config: CEAConfig, scenario: str, payload: Dict[str, Any]):
         new_scenario_name = validate_scenario_name(new_scenario_name)
 
     try:
-        new_path = secure_path(os.path.join(config.project, new_scenario_name))
+        new_path = secure_path(os.path.join(project, new_scenario_name))
         os.rename(scenario_path, new_path)
         if config.scenario_name == scenario:
             config.scenario_name = new_scenario_name
-            if isinstance(config, CEADatabaseConfig):
-                await config.save()
-            else:
-                config.save()
+            config.save()
         return {'name': new_scenario_name}
     except OSError:
         raise HTTPException(
@@ -682,24 +663,18 @@ async def put(config: CEAConfig, scenario: str, payload: Dict[str, Any]):
         )
 
 
-@router.delete('/', dependencies=[CEASeverDemoAuthCheck])
-async def delete_project(project_root: CEAProjectRoot, project_info: ProjectPath):
+@router.delete('/')
+async def delete_project(project: CEAProject, project_root: CEAProjectRoot):
     """Delete project"""
-    project_path = project_info.project
-    if project_root is not None and not project_path.startswith(project_root):
-        project_path = os.path.join(project_root, project_path)
-
-    project = secure_path(project_path)
-    if not os.path.exists(project):
+    if project_root is not None and os.path.realpath(project) == os.path.realpath(project_root):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail='Project does not exist.',
+            detail="Cannot delete the project root directory.",
         )
-
     try:
         # TODO: Check for any current open scenarios or jobs
         shutil.rmtree(project)
-        return {'message': 'Project deleted', 'project': project_info.project}
+        return {'message': 'Project deleted', 'project': project}
     except OSError as e:
         traceback.print_exc()
         logger.error(e)
@@ -709,16 +684,15 @@ async def delete_project(project_root: CEAProjectRoot, project_info: ProjectPath
                    'Try and refresh the page again.',
         )
 
-@router.delete('/scenario', dependencies=[CEASeverDemoAuthCheck])
-async def delete_scenario(project_root: CEAProjectRoot, scenario_info: ScenarioPath):
-    """Delete scenario from project"""
-    project_path = scenario_info.project
-    if project_root is not None and not project_path.startswith(project_root):
-        project_path = os.path.join(project_root, project_path)
 
-    project = secure_path(project_path)
-    scenario = scenario_info.scenario_name
-    validate_scenario_name(scenario)
+class DeleteScenarioBody(BaseModel):
+    scenario_name: str
+
+
+@router.delete('/scenario')
+async def delete_scenario(project: CEAProject, body: DeleteScenarioBody):
+    """Delete scenario from project"""
+    scenario = validate_scenario_name(body.scenario_name)
 
     scenario_path = secure_path(os.path.join(project, scenario))
     if not os.path.exists(scenario_path):
@@ -742,10 +716,11 @@ async def delete_scenario(project_root: CEAProjectRoot, scenario_info: ScenarioP
 
 
 
-@router.post('/scenario/{scenario}/duplicate', dependencies=[CEASeverDemoAuthCheck])
-async def duplicate_scenario(project_info: CEAProjectInfo, scenario: str, new_scenario_info: NewScenarioInfo):
+@router.post('/scenario/{scenario}/duplicate')
+async def duplicate_scenario(project: CEAProject, scenario: str, new_scenario_info: NewScenarioInfo):
     """Duplicate Scenario"""
-    scenario_path = secure_path(os.path.join(project_info.project, scenario))
+    scenario = validate_scenario_name(scenario)
+    scenario_path = secure_join_under_root(project, scenario)
 
     if not os.path.exists(scenario_path):
         raise HTTPException(
@@ -753,15 +728,14 @@ async def duplicate_scenario(project_info: CEAProjectInfo, scenario: str, new_sc
             detail='Scenario does not exist.',
         )
 
-    new_scenario_name = new_scenario_info.name
-    validate_scenario_name(new_scenario_name)
+    new_scenario_name = validate_scenario_name(new_scenario_info.name)
 
-    new_path = secure_path(os.path.join(project_info.project, new_scenario_name))
+    new_path = secure_join_under_root(project, new_scenario_name)
     try:
         # TODO: Check for any current open scenarios or jobs
         # TODO: Copy only necessary files
         shutil.copytree(scenario_path, new_path)
-        return {'scenarios': cea.config.get_scenarios_list(project_info.project)}
+        return {'scenarios': cea.config.get_scenarios_list(project)}
     except OSError as e:
         logger.error(e)
         raise HTTPException(

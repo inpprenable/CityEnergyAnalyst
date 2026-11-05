@@ -53,6 +53,7 @@ from cea.optimization_new.user_network_loader import (
     map_buildings_to_networks,
     UserNetworkLoaderError
 )
+from cea.scripts import by_name, tool_ref
 
 
 class Domain(object):
@@ -151,11 +152,11 @@ class Domain(object):
             # Network name is required for optimization - no auto-generation
             if not network_name or not network_name.strip():
                 raise UserNetworkLoaderError(
-                    "No base network specified for optimization.\n\n"
-                    "The 'network-name' parameter is required for district-scale optimization.\n"
-                    "A pre-generated network layout must exist before running optimization.\n\n"
+                    "No base network specified for optimisation.\n\n"
+                    "The 'network-name' parameter is required for district-scale optimisation.\n"
+                    "A pre-generated network layout must exist before running optimisation.\n\n"
                     "Resolution:\n"
-                    "  1. Run 'network-layout' tool first to generate a network layout\n"
+                    f"  1. Run {tool_ref('network-layout')} first to generate a network layout\n"
                     "  2. Set 'network-name' in [optimization-new] config to the generated network name"
                 )
 
@@ -202,20 +203,20 @@ class Domain(object):
                     error_msg = (
                         f"Network '{network_name}' exists for {other_type} but not for {network_type}.\n\n"
                         "Possible causes:\n"
-                        f"  - {network_type} was not selected when running 'network-layout' tool\n"
+                        f"  - {network_type} was not selected when running '{by_name('network-layout').label}'\n"
                         f"  - Buildings have no {('cooling' if network_type == 'DC' else 'heating')} demand, so {network_type} was skipped\n\n"
                         "Resolution:\n"
-                        f"  1. Re-run 'network-layout' tool ensuring {network_type} is selected in the network-type parameter\n"
+                        f"  1. Re-run {tool_ref('network-layout')} ensuring {network_type} is selected in the include-services parameter\n"
                         f"  2. Check if buildings have {('cooling' if network_type == 'DC' else 'heating')} demand in scenario/outputs/data/demand/\n"
                     )
                 else:
                     error_msg = (
                         f"No {network_type} networks found in this scenario.\n\n"
                         "Possible causes:\n"
-                        "  - Network-layout tool was not run yet\n"
-                        f"  - Network-layout tool skipped {network_type} generation due to zero demand\n\n"
+                        f"  - '{by_name('network-layout').label}' was not run yet\n"
+                        f"  - '{by_name('network-layout').label}' skipped {network_type} generation due to zero demand\n\n"
                         "Resolution:\n"
-                        f"  1. Run 'network-layout' tool to generate the network (ensure buildings have demand for {network_type})\n"
+                        f"  1. Run {tool_ref('network-layout')} to generate the network (ensure buildings have demand for {network_type})\n"
                         f"  2. Check if buildings have {('cooling' if network_type == 'DC' else 'heating')} demand in scenario/outputs/data/demand/\n"
                     )
 
@@ -429,7 +430,7 @@ class Domain(object):
                     "  All buildings have assemblies with no components (e.g., SUPPLY_HEATING_AS0, SUPPLY_COOLING_AS0)\n"
                     "  → These assemblies mean 'no system' and are only for buildings with zero demand\n\n"
                     "Solutions:\n"
-                    "  1. Update Building Properties/Supply to use valid assemblies for buildings with demand:\n"
+                    "  1. Update building properties > supply to use valid assemblies for buildings with demand:\n"
                     "     → For BUILDING scale: SUPPLY_HEATING_AS1, SUPPLY_COOLING_AS1, etc.\n"
                     "     → For DISTRICT scale: SUPPLY_HEATING_AS4, SUPPLY_COOLING_AS4, etc.\n"
                     "  2. Or manually set at least one building to DISTRICT scale to define network supply options\n"
@@ -456,7 +457,7 @@ class Domain(object):
         if buildings_without_supply:
             print(f"  Note: {len(buildings_without_supply)} building(s) have no supply components in base case:")
             print(f"    {[b.identifier for b in buildings_without_supply]}")
-            print("    → These buildings will be network-supplied if connected during optimization")
+            print("    → These buildings will be network-supplied if connected during optimisation")
 
         [building.calculate_supply_system(building_energy_potentials[building.identifier])
             for building in buildings_with_supply]
@@ -1029,8 +1030,8 @@ def main(config: cea.config.Configuration):
                 print("  Loading ALL buildings in scenario (network + standalone)\n")
             # Don't override buildings_to_optimize - let it load all buildings or user-specified subset
     else:
-        # Autogenerated layout mode - Building Properties/Supply settings determines connectivity
-        print("\nUsing auto-generated network layout (connectivity from Building Properties/Supply settings DISTRICT scale)")
+        # Autogenerated layout mode - building properties > supply settings determines connectivity
+        print("\nUsing auto-generated network layout (connectivity from building properties > supply settings DISTRICT scale)")
 
     start_time = time.time()
     current_domain.load_buildings(buildings_to_optimize)
@@ -1065,8 +1066,8 @@ def main(config: cea.config.Configuration):
 
         print(f"✓ All {len(network_buildings)} network buildings are in loaded buildings")
 
-        # VALIDATION 2: Check if Building Properties/Supply settings matches network layout
-        print("\nValidating Building Properties/Supply settings against network layout:")
+        # VALIDATION 2: Check if building properties > supply settings matches network layout
+        print("\nValidating building properties > supply settings against network layout:")
         mismatches = []
 
         for building in current_domain.buildings:
@@ -1077,7 +1078,7 @@ def main(config: cea.config.Configuration):
 
             # Check for mismatches
             if in_network and not supply_is_district:
-                # Building is in network but Building Properties/Supply settings has BUILDING scale
+                # Building is in network but building properties > supply settings has BUILDING scale
                 mismatches.append({
                     'building': building_id,
                     'issue': 'in_network_but_building_scale',
@@ -1085,7 +1086,7 @@ def main(config: cea.config.Configuration):
                     'supply_csv': 'BUILDING scale'
                 })
             elif not in_network and supply_is_district:
-                # Building is NOT in network but Building Properties/Supply settings has DISTRICT scale
+                # Building is NOT in network but building properties > supply settings has DISTRICT scale
                 mismatches.append({
                     'building': building_id,
                     'issue': 'not_in_network_but_district_scale',
@@ -1102,16 +1103,16 @@ def main(config: cea.config.Configuration):
                 print("{:<12} {:<15} {:<20}".format(m['building'], m['network'], m['supply_csv']))
 
             error_msg = (
-                f"\n\n✗ ERROR: Building Properties/Supply settings do not match network layout '{config.optimization_new.network_name}'.\n\n"
-                "Buildings IN network must have DISTRICT scale in Building Properties/Supply settings:\n"
+                f"\n\n✗ ERROR: building properties > supply settings do not match network layout '{config.optimization_new.network_name}'.\n\n"
+                "Buildings IN network must have DISTRICT scale in building properties > supply settings:\n"
                 f"  - In network: {sorted(network_buildings)}\n\n"
-                "Buildings NOT in network must have BUILDING scale in Building Properties/Supply settings:\n"
+                "Buildings NOT in network must have BUILDING scale in building properties > supply settings:\n"
                 f"  - Not in network: {sorted(loaded_buildings - network_buildings)}\n\n"
-                "Please update Building Properties/Supply settings to match the network layout."
+                "Please update building properties > supply settings to match the network layout."
             )
             raise ValueError(error_msg)
 
-        print("✓ All buildings have matching Building Properties/Supply settings")
+        print("✓ All buildings have matching building properties > supply settings")
 
         # Apply network connectivity (all validations passed)
         print("\nApplying network connectivity:")
@@ -1127,18 +1128,18 @@ def main(config: cea.config.Configuration):
 
         print("="*80 + "\n")
 
-    # If using auto-generated layout, just report connectivity from Building Properties/Supply settings
+    # If using auto-generated layout, just report connectivity from building properties > supply settings
     # The network layout will be generated dynamically during optimization using Steiner tree algorithm
     # No need to load_base_network() - it would fail trying to load non-existent files
     if not config.optimization_new.network_name:
-        print("\nConnectivity determined from Building Properties/Supply settings; layout will be auto-generated:")
+        print("\nConnectivity determined from building properties > supply settings; layout will be auto-generated:")
         network_buildings = [b.identifier for b in current_domain.buildings if b.initial_connectivity_state != 'stand_alone']
         standalone_buildings = [b.identifier for b in current_domain.buildings if b.initial_connectivity_state == 'stand_alone']
         if network_buildings:
-            print(f"  Buildings for auto-generated networks (DISTRICT scale in Building Properties/Supply settings): {network_buildings}")
+            print(f"  Buildings for auto-generated networks (DISTRICT scale in building properties > supply settings): {network_buildings}")
             print("    → Network layout will be generated using Steiner tree algorithm on street network")
         if standalone_buildings:
-            print(f"  Standalone buildings (BUILDING scale in Building Properties/Supply settings): {standalone_buildings}")
+            print(f"  Standalone buildings (BUILDING scale in building properties > supply settings): {standalone_buildings}")
         print()
 
     start_time = time.time()

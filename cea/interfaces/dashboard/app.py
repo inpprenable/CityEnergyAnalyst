@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 import os
 import signal
 
-from fastapi import FastAPI, status, Request
+from fastapi import FastAPI, Depends, status, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -10,12 +10,12 @@ from fastapi.responses import JSONResponse
 import cea.interfaces.dashboard.api as api
 import cea.interfaces.dashboard.plots.routes as plots
 import cea.interfaces.dashboard.server as server
-from cea.interfaces.dashboard.lib.database.models import create_db_and_tables
 from cea.interfaces.dashboard.lib.database.session import close_db_connection
-from cea.interfaces.dashboard.lib.cache.provider import cleanup_cache_connections
+from cea.interfaces.dashboard.lib.cache.provider import cleanup_cache_connections, init_cache
 from cea.interfaces.dashboard.lib.cors import CORSConfig
 from cea.interfaces.dashboard.lib.logs import logger, getCEAServerLogger
-from cea.interfaces.dashboard.lib.socketio import socket_app
+from cea.interfaces.dashboard.lib.socketio import socket_app, init_socketio_manager
+from cea.interfaces.dashboard.dependencies import require_authenticated
 from cea.interfaces.dashboard.settings import get_settings
 
 zombie_logger = getCEAServerLogger("cea-server-zombie")
@@ -58,7 +58,7 @@ def setup_sigchld_handler():
 
     # Register SIGCHLD handler
     signal.signal(signal.SIGCHLD, sigchld_handler)
-    zombie_logger.info("SIGCHLD handler registered for automatic zombie reaping")
+    zombie_logger.debug("SIGCHLD handler registered for automatic zombie reaping")
 
 
 @asynccontextmanager
@@ -66,21 +66,8 @@ async def lifespan(_: FastAPI):
     # Setup zombie process reaping
     setup_sigchld_handler()
 
-    try:
-        # FIXME: sqlite not working with async adapter
-        await create_db_and_tables()
-    except Exception as e:
-        logger.error(f"Failed to create database tables: {e}")
-
-    # Cleanup old and stale downloads on startup
-    try:
-        from cea.interfaces.dashboard.server.downloads import cleanup_old_downloads, cleanup_stale_downloads
-        from cea.interfaces.dashboard.lib.database.session import get_session_context
-        async with get_session_context() as session:
-            await cleanup_old_downloads(session)
-            await cleanup_stale_downloads(session)
-    except Exception as e:
-        logger.error(f"Failed to cleanup downloads: {e}")
+    await init_cache()
+    init_socketio_manager()
 
     yield
 
@@ -93,7 +80,7 @@ async def lifespan(_: FastAPI):
     await cleanup_cache_connections()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan, dependencies=[Depends(require_authenticated)])
 socket_app.other_asgi_app = app
 
 # Setup CORS
@@ -104,10 +91,6 @@ if cors_origin == "*":
     origins = ["*"]
     # Disable credentials with wildcard origin for security
     allow_credentials = False
-    logger.warning(
-        "CORS: Using wildcard origin ('*') with credentials disabled. "
-        "Only use this in local development."
-    )
 else:
     origins = [o.strip() for o in cors_origin.split(",")]
     allow_credentials = True
@@ -117,7 +100,8 @@ cors_config = CORSConfig(
     origins=origins,
     allow_credentials=allow_credentials,
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-    headers=["Content-Type", "Authorization", "X-Requested-With", "Accept"]
+    headers=["Content-Type", "Authorization", "X-Requested-With", "Accept",
+             "X-CEA-Project", "X-CEA-Scenario-Name", "X-CEA-Child-Scenario"]
 )
 
 app.add_middleware(
@@ -132,9 +116,20 @@ app.add_middleware(
 app.mount("/socket.io", socket_app, "socketio")
 
 # Import other routers
-app.include_router(api.router, prefix='/api')
+app.include_router(api.router)
 app.include_router(plots.router, prefix='/plots')
 app.include_router(server.router, prefix='/server')
+
+# Mount the public demo sub-app when demo scenarios are configured.
+# The sub-app is a standalone FastAPI instance and does NOT inherit the
+# require_authenticated dependency above — the anonymous boundary is structural.
+if get_settings().public_demo_scenarios:
+    from cea.interfaces.dashboard.api.demo import app as demo_app
+    app.mount("/demo", demo_app)
+    logger.debug(
+        "Public demo sub-app mounted at /demo (%d scenario(s))",
+        len(get_settings().public_demo_scenarios),
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -148,7 +143,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     cors_headers = cors_config.get_response_headers(request_origin)
 
     return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         content={"detail": exc.errors()},
         headers=cors_headers
     )

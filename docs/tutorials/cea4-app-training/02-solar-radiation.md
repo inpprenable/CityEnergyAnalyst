@@ -33,7 +33,22 @@ Uses the DAYSIM engine to perform detailed solar radiation analysis on all build
 | **Walls grid** | Grid resolution for wall surfaces (m) | 2 (default, recommended) |
 
 - **Advanced Parameters** (generally leave as default)
-- **Level of Details' roof-grid** and **walls-grid**: Control the resolution of solar radiation calculations. Smaller values = more detail but much longer computation. Default value of 2 m provides good balance. Not recommended to change unless you have specific requirements.
+- **Level of Details** (`roof-grid` and `walls-grid`): Control the resolution of solar radiation calculations. Smaller values = more detail but much longer computation. Default value of 2 m provides good balance. Not recommended to change unless you have specific requirements.
+
+### Reproducibility and Monte Carlo Noise (Advanced)
+
+DAYSIM uses Monte Carlo sampling, so two runs with identical inputs can differ by roughly 0.2-1.4% per sensor, including between machines and operating systems. This is normal and small compared with other modelling uncertainties.
+
+The noise can be removed by setting `rad-ab`, `rad-dj` and `rad-sj` to 0 together. This eliminates every random draw, and results become bit-identical between runs.
+
+**Do not use these settings for results you intend to use.**
+
+- `rad-ab` (ambient bounces) is the maximum number of diffuse bounces in DAYSIM's ambient (indirect) calculation. It is not a sampling parameter itself, but it switches on the ambient calculation, which uses Monte Carlo sampling and is the main source of the noise. It also gates the sky-diffuse contribution, so setting it to 0 understated total district irradiance by about 58% in testing on a real scenario.
+- `rad-dj` (direct jitter) randomises where on each light source direct rays are aimed. At 0, each source is sampled at fixed points, which is smoother but somewhat less accurate.
+- `rad-sj` (specular sampling jitter) randomises the direction of specular (highlight) samples on rough reflective surfaces. At 0, no randomisation takes place.
+- `rad-dj` and `rad-sj` only contribute to Monte Carlo sampling noise once `rad-ab = 0`; otherwise ambient sampling dominates.
+
+Use the all-zero combination only for testing or QA, for example to confirm that a change to geometry or configuration did not alter the radiation results.
 
 ### How to Use
 
@@ -62,7 +77,7 @@ For each building `BXXX`, the feature generates:
 - Hourly solar radiation values (W/m²) for every surface point
 - 8,760 hours × surface points matrix
 
-**Radiation metadata file**: `{scenario}/outputs/data/solar-radiation/BXXX_radiation_metadata.csv`
+**Radiation metadata file**: `{scenario}/outputs/data/solar-radiation/BXXX_geometry.csv`
 - Surface properties (area, orientation, tilt)
 - Annual cumulative radiation per surface
 - Surface coordinates
@@ -197,7 +212,8 @@ Use DAYSIM instead of CRAX when:
 - **Solution**: Use DAYSIM for accurate results; report discrepancy if CRAX shows systematic errors
 
 **Issue**: Void deck buildings fail
-- **Solution**: CRAX does not support void decks; use DAYSIM instead
+- **Solution**: CRAX does not support void decks; use DAYSIM instead. See
+  [Void Decks](08-data-management.md#void-decks) for how they are defined.
 
 ---
 

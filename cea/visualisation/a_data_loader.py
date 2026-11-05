@@ -11,11 +11,13 @@ import pandas as pd
 from cea.import_export.result_summary import (
     get_emission_context,
     process_building_summary,
+    write_selected_buildings_file,
     exec_aggregate_time_period,
     slice_hourly_results_for_custom_time_period,
 )
 from cea.inputlocator import InputLocator
 from cea.utilities.standardize_coordinates import get_geographic_coordinate_system
+from cea.scripts import tool_ref
 
 __author__ = "Zhongming Shi"
 __copyright__ = "Copyright 2025, Architecture and Building Systems - ETH Zurich"
@@ -133,27 +135,26 @@ def raise_missing_pv_error(pv_codes, context='file'):
         if len(pv_codes) == 1:
             error_msg = (
                 f"PV data missing for panel type: {pv_codes[0]} in emission results. "
-                f"Please run the 'emissions' script with include_pv=True and pv_codes=['{pv_codes[0]}'] "
-                f"to include PV offsetting in emission calculations."
+                f"Please re-run {tool_ref('final-energy')} with this panel type selected under panels-on-roof/wall, "
+                f"then {tool_ref('emissions')}."
             )
         else:
-            pv_list = ', '.join([f"'{code}'" for code in sorted(pv_codes)])
             error_msg = (
                 f"PV data missing for panel type(s): {', '.join(sorted(pv_codes))} in emission results. "
-                f"Please run the 'emissions' script with include_pv=True and pv_codes=[{pv_list}] "
-                f"to include PV offsetting in emission calculations."
+                f"Please re-run {tool_ref('final-energy')} with these panel types selected under panels-on-roof/wall, "
+                f"then {tool_ref('emissions')}."
             )
     else:
         # Error when PV result files don't exist
         if len(pv_codes) == 1:
             error_msg = (
                 f"PV electricity results missing for panel type: {pv_codes[0]}. "
-                f"Please run the 'photovoltaic (PV) panels' script first to generate PV potential results for this panel type."
+                f"Please run {tool_ref('photovoltaic')} first to generate PV potential results for this panel type."
             )
         else:
             error_msg = (
                 f"PV electricity results missing for panel type(s): {', '.join(sorted(pv_codes))}. "
-                f"Please run the 'photovoltaic (PV) panels' script first to generate PV potential results for these panel types."
+                f"Please run {tool_ref('photovoltaic')} first to generate PV potential results for these panel types."
             )
 
     print(f"ERROR: {error_msg}")
@@ -811,6 +812,12 @@ def _export_operational_emissions_to_plots_folder(locator, whatif_names, buildin
         df_result.to_csv(out_path, index=False, float_format='%.3f')
 
 
+# Features whose results live under a what-if scenario: exported to the plots folder by
+# a dedicated writer rather than by process_building_summary.
+WHATIF_PLOT_FEATURES = ('heat-rejection', 'final-energy',
+                        'lifecycle-emissions', 'operational-emissions')
+
+
 # Trigger the summary feature and point to the csv results file
 class csv_pointer:
     """Maps user input combinations to pre-defined CSV file paths."""
@@ -895,6 +902,23 @@ class csv_pointer:
 
     def execute_summary(self, bool_include_advanced_analytics):
         """Executes the summary feature to generate the required CSV output."""
+        # The what-if branches below write their own intermediate CSV and return,
+        # bypassing process_building_summary -- which is what writes
+        # selected_buildings.csv for every other feature. Without it the plot has no
+        # architecture data to normalise or sort by, so write it here for all of them.
+        # write_selected_buildings_file raises on failure rather than swallowing it, so a
+        # bad write aborts the plot instead of reading back a previous run's data.
+        if self.plot_cea_feature in WHATIF_PLOT_FEATURES and self.whatif_names:
+            # write_selected_buildings_file returns the criteria-filtered building names --
+            # assign it back, or year/construction-type/use-type filters change
+            # selected_buildings.csv while the excluded buildings stay in the plot data.
+            self.buildings = write_selected_buildings_file(
+                self.locator, self.locator.get_export_plots_selected_building_file(),
+                self.buildings,
+                self.integer_year_start, self.integer_year_end, self.list_construction_type,
+                self.list_use_type, self.min_ratio_as_main_use, bool_use_acronym=True,
+            )
+
         if self.plot_cea_feature == 'heat-rejection':
             if not self.whatif_names:
                 return

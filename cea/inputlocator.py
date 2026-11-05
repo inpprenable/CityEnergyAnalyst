@@ -10,6 +10,9 @@ import tempfile
 
 import yaml
 
+# libyaml's loader parses large what-if configurations an order of magnitude faster.
+_YAML_LOADER = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
+
 
 def _read_structured_file(path):
     """Read a structured config file and return the parsed dict.
@@ -20,7 +23,7 @@ def _read_structured_file(path):
     """
     with open(path, 'r') as handle:
         if path.endswith(('.yml', '.yaml')):
-            return yaml.safe_load(handle)
+            return yaml.load(handle, Loader=_YAML_LOADER)
         return json.load(handle)
 
 
@@ -67,6 +70,9 @@ class InputLocator(object):
 
     # SCENARIO
     def __init__(self, scenario, plugins=None):
+        """Bind this locator to `scenario`'s folder and wrap every schema-declared locator
+        method for read()/write() access. The temporary-file directory is not created here;
+        see `get_temporary_folder`."""
         if not plugins:
             plugins = []
         self.scenario = scenario
@@ -76,8 +82,13 @@ class InputLocator(object):
         self.plugins = plugins
         self.optimization_run = None
 
-        self._temp_directory = tempfile.mkdtemp()
-        atexit.register(self._cleanup_temp_directory)
+        # Created lazily (see get_temporary_folder) -- most locators never touch it, and
+        # mkdtemp()/atexit.register() on every one of the ~200+ construction sites left
+        # orphaned temp directories and an ever-growing atexit list for the process lifetime.
+        self.__temp_directory = None
+        # PID of the process that created the directory. Only that process may remove it:
+        # an unpickled copy in a worker must not delete what the parent is still reading.
+        self.__temp_directory_pid = None
 
     def __getstate__(self):
         """Make sure we can pickle an InputLocator..."""
@@ -86,10 +97,17 @@ class InputLocator(object):
             "db_path": self.db_path,
             "weather_path": self.weather_path,
             "plugins": [str(p) for p in self.plugins],
-            "_temp_directory": self._temp_directory
+            # Materialise before crossing a process boundary. Workers write per-building
+            # files here that the parent reads back (see demand_writers), so every copy of
+            # this locator has to name the same directory -- if each side created its own on
+            # first use, they would never see each other's files.
+            "_temp_directory": self.get_temporary_folder(),
+            "_temp_directory_pid": self.__temp_directory_pid,
         }
 
     def __setstate__(self, state):
+        """Restore an unpickled InputLocator, re-registering temp-directory cleanup if the
+        pickled instance had already created one (see `get_temporary_folder`)."""
         from cea.plugin import instantiate_plugin
 
         self.scenario = state["scenario"]
@@ -97,12 +115,23 @@ class InputLocator(object):
         self.weather_path = state["weather_path"]
         self.plugins = [instantiate_plugin(plugin_fqname) for plugin_fqname in state["plugins"]]
         self._wrap_locator_methods(self.plugins)
-        self._temp_directory = state["_temp_directory"]
+        self.__temp_directory = state["_temp_directory"]
+        self.__temp_directory_pid = state["_temp_directory_pid"]
+        # `__getstate__` materialises the directory, so there is always one to clean up here.
+        # Whether this copy is allowed to is decided by `_cleanup_temp_directory`.
+        atexit.register(self._cleanup_temp_directory)
 
     def _cleanup_temp_directory(self):
-        # Cleanup the temporary directory when the object is destroyed
-        if os.path.exists(self._temp_directory):
-            shutil.rmtree(self._temp_directory)
+        """atexit callback: remove this locator's temporary directory, if one was ever
+        created (see `get_temporary_folder`).
+
+        Only the creating process deletes it. Worker processes hold unpickled copies naming
+        the parent's directory, and deleting it on their way out would take the results with
+        it while the parent is still reading them."""
+        if self.__temp_directory_pid != os.getpid():
+            return
+        if self.__temp_directory is not None and os.path.exists(self.__temp_directory):
+            shutil.rmtree(self.__temp_directory)
 
     def _wrap_locator_methods(self, plugins):
         """
@@ -171,10 +200,123 @@ class InputLocator(object):
         """Returns the inputs folder of a scenario"""
         return os.path.join(self.scenario, "inputs")
 
+    def get_output_folder(self):
+        """Returns the outputs folder of a scenario"""
+        return os.path.join(self.scenario, "outputs")
+
     def get_export_folder(self):
         """Returns the export folder of a scenario"""
         return os.path.join(self.scenario, "export")
+    
+    def get_district_pathway_container_folder(self):
+        """Returns the folder storing district evolution pathways.
 
+        `scenario/outputs/pathways`"""
+        return os.path.join(self.scenario, "outputs", "pathways")
+
+    def get_district_pathway_folder(self, pathway_name: str):
+        """Returns the folder storing one district evolution pathway.
+
+        `scenario/outputs/pathways/{pathway_name}`"""
+        return os.path.join(self.get_district_pathway_container_folder(), pathway_name)
+
+    def get_state_in_time_scenario_folder(self, pathway_name: str, year_of_state: int):
+        """Returns the folder containing a specific pathway state scenario.
+
+        `scenario/outputs/pathways/{pathway_name}/state_{year_of_state}`"""
+        return os.path.join(self.get_district_pathway_folder(pathway_name), f'state_{year_of_state}')
+
+    def get_district_pathway_log_file(self, pathway_name: str):
+        """Returns the log file for a district evolution pathway.
+
+        `scenario/outputs/pathways/{pathway_name}/district_pathway_log.yml`"""
+        return os.path.join(self.get_district_pathway_folder(pathway_name), 'district_pathway_log.yml')
+
+    def get_district_pathway_metadata_file(self, pathway_name: str):
+        """Returns the hidden metadata sidecar for a district evolution
+        pathway. Stores small UI/runtime hints (last-opened timestamps,
+        cached signatures) that aren't part of the canonical pathway log.
+
+        `scenario/outputs/pathways/{pathway_name}/.pathway_metadata.json`"""
+        return os.path.join(
+            self.get_district_pathway_folder(pathway_name),
+            '.pathway_metadata.json',
+        )
+
+    def get_district_pathway_state_signature_file(
+        self, pathway_name: str, year_of_state: int,
+    ):
+        """Returns the hidden signature file for a pathway state year.
+        The signature records when a state was built / simulated and is
+        used by the dashboard to flag stale states.
+
+        `scenario/outputs/pathways/{pathway_name}/state_{year}/.district_pathway_signature.json`"""
+        return os.path.join(
+            self.get_state_in_time_scenario_folder(pathway_name, year_of_state),
+            '.district_pathway_signature.json',
+        )
+
+    def get_intervention_templates_file(self):
+        """Returns the scenario-level intervention-template file.
+
+        `scenario/outputs/pathways/intervention_templates.yml`"""
+        return os.path.join(self.get_district_pathway_container_folder(), 'intervention_templates.yml')
+
+    def get_district_pathway_state_status_folder(self, pathway_name: str):
+        """Returns the folder containing per-state pathway status records.
+
+        `scenario/outputs/pathways/{pathway_name}/state_status`"""
+        return os.path.join(self.get_district_pathway_folder(pathway_name), 'state_status')
+
+    def get_district_pathway_state_status_file(self, pathway_name: str, year_of_state: int):
+        """Returns the JSON status record for one pathway state year.
+
+        `scenario/outputs/pathways/{pathway_name}/state_status/state_{year_of_state}.json`"""
+        return os.path.join(
+            self.get_district_pathway_state_status_folder(pathway_name),
+            f'state_{year_of_state}.json',
+        )
+
+    def get_kpi_folder(self):
+        """Returns the folder that holds KPI cache state.
+
+        `scenario/outputs/kpis`"""
+        return os.path.join(self.scenario, 'outputs', 'kpis')
+
+    def get_kpi_status_file(self):
+        """Returns the JSON cache file recording per-KPI value +
+        the three hashes that gate freshness.
+
+        `scenario/outputs/kpis/kpi_status.json`"""
+        return os.path.join(self.get_kpi_folder(), 'kpi_status.json')
+    
+    def get_district_pathway_emissions_timeline_path(self, pathway_name: str):
+        """Returns the district-level pathway emissions timeline CSV file.
+        
+        `scenario/outputs/pathways/{pathway_name}/district_pathway_emissions_timeline.csv`"""
+        return os.path.join(
+            self.get_district_pathway_folder(pathway_name),
+            'district_pathway_emissions_timeline.csv',
+        )
+    
+    def get_building_pathway_emissions_timelines_folder(self, pathway_name: str):
+        """Returns the folder containing per-building pathway emissions timeline CSV files.
+        
+        `scenario/outputs/pathways/{pathway_name}/building_pathway_emissions_timelines`"""
+        return os.path.join(
+            self.get_district_pathway_folder(pathway_name),
+            'building_pathway_emissions_timelines',
+        )
+
+    def get_building_pathway_emissions_timeline_file(self, pathway_name: str, building_name: str):
+        """Returns the per-building pathway emissions timeline CSV file for a specific building.
+        
+        `scenario/outputs/pathways/{pathway_name}/building_pathway_emissions_timelines/{building_name}_pathway_emissions_timeline.csv`"""
+        return os.path.join(
+            self.get_building_pathway_emissions_timelines_folder(pathway_name),
+            f'{building_name}_pathway_emissions_timeline.csv'
+        )
+    
     def get_export_results_folder(self):
         """Returns the folder storing the summary and analytics results in the export folder of a scenario"""
         """scenario/export/results"""
@@ -393,6 +535,44 @@ class InputLocator(object):
     def get_optimization_results_folder(self):
         """Returns the folder containing the scenario's optimization results"""
         return os.path.join(self.scenario, 'outputs', 'data', 'optimization')
+
+    # ── Canvas Builder storage ──────────────────────────────────
+    # Each canvas is one folder named after its display name. Edits
+    # write straight to the folder — there's no draft / temp
+    # staging area. Inside any canvas folder:
+    #   ├── canvas.yml
+    #   ├── layout.yml
+    #   ├── feature_card.yml
+    #   └── data/<cardId>/...
+    # Path helpers do not auto-create folders — callers should
+    # use `_ensure_folder` when they intend to write.
+    def get_canvas_folder(self):
+        """scenario/outputs/canvas"""
+        return os.path.join(self.scenario, 'outputs', 'canvas')
+
+    def get_saved_canvas_folder(self, name):
+        """scenario/outputs/canvas/<name> — a saved canvas"""
+        return os.path.join(self.get_canvas_folder(), name)
+
+    def get_canvas_yml(self, canvas_folder):
+        """`<canvas_folder>/canvas.yml` — display name, view, scenarios, timestamps"""
+        return os.path.join(canvas_folder, 'canvas.yml')
+
+    def get_canvas_layout_yml(self, canvas_folder):
+        """`<canvas_folder>/layout.yml` — per-card grid positions + sizes"""
+        return os.path.join(canvas_folder, 'layout.yml')
+
+    def get_canvas_feature_card_yml(self, canvas_folder):
+        """`<canvas_folder>/feature_card.yml` — per-card type / feature / plotConfig"""
+        return os.path.join(canvas_folder, 'feature_card.yml')
+
+    def get_canvas_data_folder(self, canvas_folder):
+        """`<canvas_folder>/data` — root for per-card raw data dumps"""
+        return os.path.join(canvas_folder, 'data')
+
+    def get_canvas_card_data_folder(self, canvas_folder, card_id):
+        """`<canvas_folder>/data/<card_id>` — raw data backing one card's plot"""
+        return os.path.join(self.get_canvas_data_folder(canvas_folder), card_id)
 
 
     def get_electrical_and_thermal_network_optimization_results_folder(self):
@@ -932,6 +1112,10 @@ class InputLocator(object):
     def get_database_components_feedstocks_energy_carriers(self):
         """scenario/inputs/database/COMPONENTS/FEEDSTOCKS/ENERGY_CARRIERS.csv"""
         return os.path.join(self.get_db4_components_feedstocks_folder(), 'ENERGY_CARRIERS.csv')
+    
+    def get_database_components_materials(self):
+        """scenario/inputs/database/COMPONENTS/MATERIALS/MATERIALS.csv"""
+        return os.path.join(self.get_db4_components_folder(), 'MATERIALS', 'MATERIALS.csv')
 
     def get_database_conversion_systems_cold_thermal_storage_names(self):
         """Return the list of thermal storage tanks"""
@@ -950,6 +1134,15 @@ class InputLocator(object):
     def get_building_properties_folder(self):
         """scenario/inputs/building-properties/"""
         return os.path.join(self.scenario, 'inputs', 'building-properties')
+
+    def get_archetype_lock_file(self):
+        """scenario/inputs/.archetype_lock.json
+
+        Records whether the archetype-derived building-property tables are locked to each
+        building's archetype, and when they were last mapped. Absent means unlocked, so a
+        scenario written before this existed needs no migration.
+        """
+        return os.path.join(self.get_input_folder(), '.archetype_lock.json')
 
     def get_terrain_folder(self):
         return os.path.join(self.scenario, 'inputs', 'topography')
@@ -1339,6 +1532,58 @@ class InputLocator(object):
     def get_thermal_network_plant_heat_requirement_file(self, network_type, network_name):
         """scenario/outputs/data/thermal-network/{network_type}/{network_name}/{network_type}_{network_name}_plant_thermal_load_kW.csv"""
         return self._get_thermal_network_results_file_path(network_type, network_name, "plant_thermal_load_kW.csv")
+
+    # ── Per-phase result files inside a phasing plan ──────────────
+    # The three helpers below extend the existing ``_phasing_*``
+    # locator family (see e.g.
+    # ``get_thermal_network_phasing_plant_heat_requirement_file``
+    # and ``get_thermal_network_phasing_massflow_edges_file``
+    # below) with the three per-phase CSVs the network KPIs
+    # depend on but that didn't have a locator yet:
+    # ``metadata_edges.csv`` (pipe lengths), the total-thermal-
+    # loss CSV, and the plant-pumping-load CSV. Each phase's
+    # outputs are copied into
+    # ``phasing-plans/{plan_name}/{network_type}/{phase}/{network_type}_{phase}_*.csv``
+    # by ``save_phase_results`` in
+    # ``cea/technologies/thermal_network/common/phasing.py``.
+    #
+    # ``..._plant_heat_requirement_file`` is intentionally absent
+    # from this group — the existing
+    # ``get_thermal_network_phasing_plant_heat_requirement_file``
+    # already covers that path.
+
+    def get_thermal_network_phasing_edge_list_file(
+        self, network_type, plan_name, phase,
+    ):
+        """phasing-plans/{plan_name}/{network_type}/{phase}/{network_type}_{phase}_metadata_edges.csv"""
+        return os.path.join(
+            self.get_thermal_network_phasing_plan_phase_folder(
+                network_type, plan_name, phase,
+            ),
+            f"{network_type}_{phase}_metadata_edges.csv",
+        )
+
+    def get_thermal_network_phasing_total_thermal_loss_file(
+        self, network_type, plan_name, phase,
+    ):
+        """phasing-plans/{plan_name}/{network_type}/{phase}/{network_type}_{phase}_total_thermal_loss_edges_kW.csv"""
+        return os.path.join(
+            self.get_thermal_network_phasing_plan_phase_folder(
+                network_type, plan_name, phase,
+            ),
+            f"{network_type}_{phase}_total_thermal_loss_edges_kW.csv",
+        )
+
+    def get_thermal_network_phasing_energy_pumping_requirements_file(
+        self, network_type, plan_name, phase,
+    ):
+        """phasing-plans/{plan_name}/{network_type}/{phase}/{network_type}_{phase}_plant_pumping_load_kW.csv"""
+        return os.path.join(
+            self.get_thermal_network_phasing_plan_phase_folder(
+                network_type, plan_name, phase,
+            ),
+            f"{network_type}_{phase}_plant_pumping_load_kW.csv",
+        )
 
     # THERMAL NETWORK PHASING
     def get_thermal_network_phasing_folder(self, network_type, plan_name):
@@ -1947,6 +2192,19 @@ class InputLocator(object):
         """
         return os.path.join(self.get_analysis_folder(whatif_name), 'emissions')
 
+    def get_emissions_whatif_operational_folder(self, whatif_name):
+        """
+        scenario/outputs/data/analysis/{whatif_name}/emissions/operational/
+
+        Per-building hourly operational emission CSVs live here. Older
+        what-if results predating this layout fall back to the legacy
+        yearly summary file (see ``get_total_yearly_operational_building``).
+
+        :param whatif_name: What-if scenario name.
+        :return: Path to the per-building operational emissions folder.
+        """
+        return os.path.join(self.get_emissions_whatif_folder(whatif_name), 'operational')
+
     def get_emissions_whatif_buildings_file(self, whatif_name):
         """
         scenario/outputs/data/analysis/{whatif_name}/emissions/emissions_buildings.csv
@@ -2007,8 +2265,17 @@ class InputLocator(object):
 
     # OTHER
     def get_temporary_folder(self):
-        """Temporary folder as returned by `tempfile`."""
-        return self._temp_directory
+        """Temporary folder as returned by `tempfile`, created on first use.
+
+        Deferred rather than created in `__init__`: most locators never call this, and
+        eagerly creating one per instance leaked a directory plus a permanent
+        `atexit` callback for every one of the many `InputLocator` instantiations
+        throughout a run."""
+        if self.__temp_directory is None:
+            self.__temp_directory = tempfile.mkdtemp()
+            self.__temp_directory_pid = os.getpid()
+            atexit.register(self._cleanup_temp_directory)
+        return self.__temp_directory
 
     def get_temporary_file(self, filename):
         """Returns the path to a file in the temporary folder with the name `filename`"""

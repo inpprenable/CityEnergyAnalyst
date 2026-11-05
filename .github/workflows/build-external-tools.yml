@@ -26,14 +26,33 @@ jobs:
         # macos-13 for x86_64, macos-latest (macos-14) for arm64
         # Ignore macos-13 for now
         os: [ubuntu-latest, windows-latest, macos-latest]
+        # TODO: Add linux-aarch64 and osx-64 (macos-13) wheel builds:
+        #   - linux-aarch64: use cibuildwheel + docker/setup-qemu-action for QEMU emulation,
+        #     with quay.io/pypa/manylinux_2_17_aarch64 image
+        #   - osx-64 (macos-13): re-enable once CRAX compile issue is fixed, or build with
+        #     CMAKE_ARGS=-DBUILD_CRAX=OFF; requires cmake and pyarrow added to [build-system].requires
+        #     in external/pyproject.toml so the pip-based build works without pixi
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup pixi
-        uses: prefix-dev/setup-pixi@v0.8.14
+        uses: prefix-dev/setup-pixi@v0.10.0
         with:
           run-install: false
+
+      - name: Set up MSVC dev environment (Windows only)
+        # The default pixi environment has no C/C++ compiler package (unlike the docker-build-wheel
+        # feature, which pulls in cxx-compiler) -- it relies on the runner's own compiler being on
+        # PATH. On ubuntu/macOS that's true by default; on Windows, cl.exe is only on PATH inside a
+        # "Developer" shell, which this step sets up. Without it, CMake fails with
+        # "CMAKE_C_COMPILER not set, after EnableLanguage" (whether scikit-build-core picks Ninja
+        # here, which needs the compiler pre-resolved on PATH, unlike the native Visual Studio
+        # generator, which finds it itself, wasn't verified -- this step works either way).
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build wheel
         working-directory: external
@@ -60,7 +79,7 @@ jobs:
           rm dist/*-linux_*.whl  # Remove original linux wheel, keep manylinux wheel
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.os }}
           path: external/dist/*.whl
@@ -72,10 +91,12 @@ jobs:
     permissions:
       actions: write # Upload artifacts
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -89,7 +110,7 @@ jobs:
         run: python -m build --sdist
 
       - name: Upload source distribution
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: source-dist
           path: external/dist/*.tar.gz
@@ -109,12 +130,12 @@ jobs:
 
     steps:
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Download wheel artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wheels-${{ matrix.os }}
           path: wheels/
@@ -137,7 +158,7 @@ jobs:
 
   #   steps:
   #   - name: Download all artifacts
-  #     uses: actions/download-artifact@v4
+  #     uses: actions/download-artifact@v8
   #     with:
   #       path: dist
   #       merge-multiple: true
@@ -163,7 +184,7 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
