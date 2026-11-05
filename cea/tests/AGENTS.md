@@ -67,6 +67,8 @@ InputLocator._cleanup_temp_directory = lambda self: None
 
 ## Related Files
 - `test_dashboard_bootstrap.py` - Dashboard preparation and launcher ordering coverage.
+- `test_dashboard_proxy_auth.py` - `CEA_AUTH_PROVIDER=proxy`: gateway headers identify the User (HTTP and Socket.IO), missing header is anonymous, forged headers are ignored in `stackauth` mode, worker tokens still work.
+- `test_dashboard_user_provisioning.py` - A non-local User's row is created once on first login; a concurrent first-login race does not fail.
 - `test_pathway_api.py` - API-level coverage for overview rows, stock/manual/mixed classification, editor endpoints, and stale-status detection.
 - `test_pathway_envelope_bake.py` - Envelope row handling when baking a state from a template: the U/GHG cache must be dropped when material layers change (issue #4059), kept when they don't.
 - `test_envelope_layer_rules.py` - When U/GHG may be blank: one material layer (name + thickness > 0)

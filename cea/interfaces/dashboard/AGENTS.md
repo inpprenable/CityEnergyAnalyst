@@ -28,6 +28,17 @@ it is proven.
 **No proxy is assumed.** The server runs locally or online and self-enforces auth
 in both cases. Never rely on a gateway or reverse proxy to pre-filter requests.
 
+**Exception (Ascend fork): `CEA_AUTH_PROVIDER=proxy`.** Default `stackauth` keeps
+upstream cookie auth. In `proxy` mode the identity comes from the gateway headers
+parsed in `lib/auth/gateway.py`; StackAuth stays in place but unused.
+- Keep every proxy change behind the `auth_provider == "proxy"` branches in
+  `get_user_id`, `get_user`, `get_auth_client` and socketio `connect`, so upstream
+  merges stay small. Guard, public routes and worker tokens are unchanged.
+- Never read the gateway headers in `stackauth` mode (forgeable).
+- Non-local Users have no sign-up step: `get_user_id` and socketio `connect` call
+  `ensure_user_cached` so the `User` row exists before a `Project` references it.
+- See `docs/adr/0001-identity-from-gateway-headers.md` (local).
+
 **Default auth:** `require_authenticated` runs as an app-level dependency on every
 route. In non-local mode it rejects unauthenticated callers (those that resolve to
 `LOCAL_USER_ID`). No per-route annotation needed — add new routes freely and they

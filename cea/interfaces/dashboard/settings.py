@@ -2,7 +2,7 @@ from functools import lru_cache
 import logging
 import os
 import secrets
-from typing import Annotated, Dict, Optional
+from typing import Annotated, Dict, Literal, Optional
 
 from pydantic import field_validator, model_validator, Field
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -46,6 +46,15 @@ class Settings(BaseSettings):
     cors_origin: str = Field(default="*", description="CORS origin(s) allowed to access the API. Use '*' for all origins (not recommended for production). For multiple origins, provide a comma-separated list (e.g. 'http://localhost:3000,https://mydomain.com')")
 
     workers: Optional[int] = Field(default=None, description="Number of workers")
+
+    auth_provider: Literal["stackauth", "proxy"] = Field(
+        default="stackauth",
+        description=(
+            "How users are identified in non-local mode. 'stackauth': StackAuth session cookies. "
+            "'proxy': trust the identity headers set by an authenticating gateway (oauth2-proxy). "
+            "See docs/adr/0001-identity-from-gateway-headers.md."
+        ),
+    )
 
     jwt_secret: Optional[str] = Field(
         default=None,

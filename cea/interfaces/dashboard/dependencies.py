@@ -12,9 +12,10 @@ from typing_extensions import Annotated
 import cea.config
 from cea.interfaces.dashboard.lib.auth import CEAAuthError, verify_worker_token
 from cea.interfaces.dashboard.lib.auth.providers import StackAuth, AuthClient
+from cea.interfaces.dashboard.lib.auth.gateway import get_gateway_user, get_gateway_user_id
 from cea.interfaces.dashboard.lib.cache.base import AsyncDictCache
 from cea.interfaces.dashboard.lib.cache.provider import get_dict_cache
-from cea.interfaces.dashboard.lib.database.models import LOCAL_USER_ID, Project
+from cea.interfaces.dashboard.lib.database.models import LOCAL_USER_ID, Project, ensure_user_cached
 from cea.interfaces.dashboard.lib.database.session import SessionDep
 from cea.interfaces.dashboard.lib.logs import logger
 from cea.interfaces.dashboard.settings import Settings, get_settings, LimitSettings
@@ -175,7 +176,7 @@ _WORKER_CALLBACK_ROUTES: frozenset = frozenset({
 })
 
 
-def get_user_id(request: Request, settings: CEAServerSettings) -> Optional[str]:
+async def get_user_id(request: Request, settings: CEAServerSettings) -> Optional[str]:
     # Return local user if local mode
     if settings.local:
         logger.info(f"Using `{LOCAL_USER_ID}`")
@@ -203,6 +204,13 @@ def get_user_id(request: Request, settings: CEAServerSettings) -> Optional[str]:
                 f"(token prefix: {worker_token[:12]}...)"
             )
 
+    # Proxy mode: the Identity gateway already authenticated the User (ADR 0001).
+    if settings.auth_provider == "proxy":
+        user_id = get_gateway_user_id(request.headers.get)
+        if user_id is not None:
+            await ensure_user_cached(user_id)
+        return user_id
+
     # Resolve cookie-based auth directly (not as a Depends param) so worker
     # requests -- which never carry cookies -- don't unconditionally trigger
     # get_auth_client()'s "Unable to determine auth client" log on every call.
@@ -217,9 +225,15 @@ def get_user_id(request: Request, settings: CEAServerSettings) -> Optional[str]:
     return None
 
 
-def get_user(auth_client: CEAAuthClient, settings: CEAServerSettings) -> Dict[str, str]:
+def get_user(request: Request, auth_client: CEAAuthClient, settings: CEAServerSettings) -> Dict[str, str]:
     if settings.local:
         return {'id': LOCAL_USER_ID}
+
+    if settings.auth_provider == "proxy":
+        user = get_gateway_user(request.headers.get)
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+        return user
 
     # Try to get user id from request cookie
     if auth_client is not None:
@@ -247,7 +261,7 @@ def get_user(auth_client: CEAAuthClient, settings: CEAServerSettings) -> Dict[st
 
 
 def get_auth_client(request: Request, settings: CEAServerSettings) -> Optional[AuthClient]:
-    if settings.local:
+    if settings.local or settings.auth_provider == "proxy":
         return None
 
     auth_client = StackAuth.from_request_cookies(request.cookies)
